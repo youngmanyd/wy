@@ -1,0 +1,83 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: situation-awareness
+  namespace: uav-edge
+  labels:
+    app: situation-awareness
+    tier: uav-edge
+spec:
+  selector:
+    app: situation-awareness
+  ports:
+    - port: 8008
+      targetPort: 8008
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: situation-awareness
+  namespace: uav-edge
+  labels:
+    app: situation-awareness
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: situation-awareness
+  template:
+    metadata:
+      labels:
+        app: situation-awareness
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8008"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Node2: most constrained (1 CPU / 2GB)
+      nodeSelector:
+        kubernetes.io/hostname: "uav-node2"
+      containers:
+        - name: situation-awareness
+          image: uav-edge-compute:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8008
+          env:
+            - name: SERVICE_ROLE
+              value: "situation-awareness"
+            - name: SERVICE_PORT
+              value: "8008"
+            - name: DOWNSTREAM_URLS
+              value: "http://decision-maker.uav-edge.svc.cluster.local:8009"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "384Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8008
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8008
+            initialDelaySeconds: 30
+            periodSeconds: 15

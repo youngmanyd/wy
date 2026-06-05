@@ -1,98 +1,47 @@
 #!/usr/bin/env bash
 # =============================================================================
-# UAV Edge — Experiment Results Collection Script
-# Collects CSV_RESULT lines from MS-10 pods and saves to experiment_results.csv
+# UAV Edge — CSV Telemetry Log Collection Script
+# Extracts CSV_RESULT: lines from telemetry-dashboard pods.
 #
 # Usage:
-#   ./collect_logs.sh [--namespace uav-edge] [--output ./experiment_results.csv]
-#   ./collect_logs.sh --tail 5000     # Increase log tail lines
-#   ./collect_logs.sh --follow        # Live mode (stream results in real-time)
+#   ./collect_logs.sh [--output experiment_results.csv] [--follow]
 # =============================================================================
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-uav-edge}"
-OUTPUT="${OUTPUT:-./experiment_results.csv}"
-TAIL_LINES="${TAIL_LINES:-10000}"
-FOLLOW_MODE=false
+OUTPUT="experiment_results.csv"
+FOLLOW=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --namespace) NAMESPACE="$2"; shift 2 ;;
-        --output) OUTPUT="$2"; shift 2 ;;
-        --tail) TAIL_LINES="$2"; shift 2 ;;
-        --follow) FOLLOW_MODE=true; shift ;;
+        --output|-o) OUTPUT="$2"; shift 2 ;;
+        --follow|-f) FOLLOW=true; shift ;;
+        --namespace|-n) NAMESPACE="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
-# CSV header matching the output format from MS-10
 CSV_HEADER="request_id,e2e_ms,rgb_branch_ms,ir_branch_ms"
-CSV_HEADER+=",ms1_compute_ms,ms2_compute_ms,ms3_compute_ms,ms4_compute_ms,ms5_compute_ms"
-CSV_HEADER+=",ms6_compute_ms,ms7_compute_ms,ms8_compute_ms,ms9_compute_ms,ms10_compute_ms"
-CSV_HEADER+=",net_ms1_ms2,net_ms1_ms3,net_ms2_ms4,net_ms3_ms5"
-CSV_HEADER+=",net_ms4_ms6,net_ms5_ms6,net_ms6_ms7,net_ms6_ms8"
-CSV_HEADER+=",net_ms7_ms9,net_ms8_ms9,net_ms9_ms10"
+CSV_HEADER+=",gateway_compute_ms,rgb_preprocessor_compute_ms,ir_preprocessor_compute_ms"
+CSV_HEADER+=",rgb_detector_compute_ms,ir_detector_compute_ms,feature_fusion_compute_ms"
+CSV_HEADER+=",object_tracker_compute_ms,situation_awareness_compute_ms,decision_maker_compute_ms"
+CSV_HEADER+=",telemetry_dashboard_compute_ms"
+CSV_HEADER+=",net_gateway_rgb_preproc_ms,net_gateway_ir_preproc_ms"
+CSV_HEADER+=",net_rgb_preproc_rgb_det_ms,net_ir_preproc_ir_det_ms"
+CSV_HEADER+=",net_rgb_det_fusion_ms,net_ir_det_fusion_ms"
+CSV_HEADER+=",net_fusion_tracker_ms,net_fusion_sa_ms"
+CSV_HEADER+=",net_tracker_decision_ms,net_sa_decision_ms"
+CSV_HEADER+=",net_decision_dashboard_ms"
 
-if $FOLLOW_MODE; then
-    echo "============================================================"
-    echo "  Live CSV Collection (Ctrl+C to stop)"
-    echo "  Namespace: ${NAMESPACE}"
-    echo "  Output:    ${OUTPUT}"
-    echo "============================================================"
-
-    # Write header
-    echo "$CSV_HEADER" > "$OUTPUT"
-
-    # Stream and filter
-    kubectl -n "$NAMESPACE" logs -l app=ms-10 -f --tail=0 | \
-        grep --line-buffered "^CSV_RESULT:" | \
-        sed -u 's/^CSV_RESULT://' | \
-        tee -a "$OUTPUT"
+if $FOLLOW; then
+    echo "Live-following telemetry-dashboard logs... (Ctrl+C to stop)"
+    echo "$CSV_HEADER"
+    kubectl logs -l app=telemetry-dashboard -n "$NAMESPACE" -f --tail=0 2>/dev/null | \
+        grep --line-buffered 'CSV_RESULT:' | sed 's/.*CSV_RESULT://'
 else
-    echo "============================================================"
-    echo "  CSV Result Collection (Batch Mode)"
-    echo "  Namespace: ${NAMESPACE}"
-    echo "  Tail:      ${TAIL_LINES} lines"
-    echo "  Output:    ${OUTPUT}"
-    echo "============================================================"
-
-    # Write header
     echo "$CSV_HEADER" > "$OUTPUT"
-
-    # Collect from all MS-10 pod replicas
-    PODS=$(kubectl -n "$NAMESPACE" get pods -l app=ms-10 -o jsonpath='{.items[*].metadata.name}')
-
-    if [ -z "$PODS" ]; then
-        echo "ERROR: No ms-10 pods found in namespace ${NAMESPACE}"
-        exit 1
-    fi
-
-    COUNT=0
-    for POD in $PODS; do
-        echo "  Collecting from pod: ${POD}..."
-        LINES=$(kubectl -n "$NAMESPACE" logs "$POD" --tail="$TAIL_LINES" | \
-            grep "^CSV_RESULT:" | \
-            sed 's/^CSV_RESULT://')
-        if [ -n "$LINES" ]; then
-            echo "$LINES" >> "$OUTPUT"
-            LINE_COUNT=$(echo "$LINES" | wc -l)
-            COUNT=$((COUNT + LINE_COUNT))
-        fi
-    done
-
-    echo ""
-    echo "============================================================"
-    echo "  Collection Complete"
-    echo "  Total CSV rows: ${COUNT}"
-    echo "  Output file:    ${OUTPUT}"
-    echo "============================================================"
-    echo ""
-    echo "Preview (first 5 rows):"
-    head -6 "$OUTPUT"
-    echo "..."
-    echo ""
-    echo "Analyze with Python:"
-    echo "  import pandas as pd"
-    echo "  df = pd.read_csv('${OUTPUT}')"
-    echo "  print(df.describe())"
+    kubectl logs -l app=telemetry-dashboard -n "$NAMESPACE" --tail=-1 2>/dev/null | \
+        grep 'CSV_RESULT:' | sed 's/.*CSV_RESULT://' >> "$OUTPUT"
+    LINES=$(wc -l < "$OUTPUT")
+    echo "Collected $((LINES - 1)) results -> ${OUTPUT}"
 fi

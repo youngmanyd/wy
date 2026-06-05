@@ -1,0 +1,84 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feature-fusion
+  namespace: uav-edge
+  labels:
+    app: feature-fusion
+    tier: uav-edge
+spec:
+  selector:
+    app: feature-fusion
+  ports:
+    - port: 8006
+      targetPort: 8006
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feature-fusion
+  namespace: uav-edge
+  labels:
+    app: feature-fusion
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feature-fusion
+  template:
+    metadata:
+      labels:
+        app: feature-fusion
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8006"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: "true"
+      containers:
+        - name: feature-fusion
+          image: uav-edge-compute:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8006
+          env:
+            - name: SERVICE_ROLE
+              value: "feature-fusion"
+            - name: SERVICE_PORT
+              value: "8006"
+            - name: DOWNSTREAM_URLS
+              value: "http://object-tracker.uav-edge.svc.cluster.local:8007,http://situation-awareness.uav-edge.svc.cluster.local:8008"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: FUSION_TIMEOUT
+              value: "5.0"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8006
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8006
+            initialDelaySeconds: 30
+            periodSeconds: 15

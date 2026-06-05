@@ -1,0 +1,9 @@
+# =============================================================================
+# Compute image: base + numpy (already in base)
+# Used by: gateway, feature-fusion, object-tracker, situation-awareness, decision-maker
+# Lightweight — suitable for constrained UAV nodes
+# =============================================================================
+ARG BASE_IMAGE=uav-edge-base:latest
+FROM ${BASE_IMAGE}
+
+COPY src/app.py /app/app.py

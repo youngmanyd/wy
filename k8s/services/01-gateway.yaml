@@ -1,0 +1,84 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: uav-edge
+  labels:
+    app: gateway
+    tier: uav-edge
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: 8001
+      targetPort: 8001
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: uav-edge
+  labels:
+    app: gateway
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: "true"
+      containers:
+        - name: gateway
+          image: uav-edge-compute:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8001
+          env:
+            - name: SERVICE_ROLE
+              value: "gateway"
+            - name: SERVICE_PORT
+              value: "8001"
+            - name: DOWNSTREAM_URLS
+              value: "http://rgb-preprocessor.uav-edge.svc.cluster.local:8002,http://ir-preprocessor.uav-edge.svc.cluster.local:8003"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: FUSION_TIMEOUT
+              value: "5.0"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 15

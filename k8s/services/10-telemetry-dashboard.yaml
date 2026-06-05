@@ -1,0 +1,82 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telemetry-dashboard
+  namespace: uav-edge
+  labels:
+    app: telemetry-dashboard
+    tier: uav-edge
+spec:
+  selector:
+    app: telemetry-dashboard
+  ports:
+    - port: 8010
+      targetPort: 8010
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-dashboard
+  namespace: uav-edge
+  labels:
+    app: telemetry-dashboard
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telemetry-dashboard
+  template:
+    metadata:
+      labels:
+        app: telemetry-dashboard
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8010"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: "true"
+      containers:
+        - name: telemetry-dashboard
+          image: uav-edge-dashboard:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8010
+          env:
+            - name: SERVICE_ROLE
+              value: "telemetry-dashboard"
+            - name: SERVICE_PORT
+              value: "8010"
+            - name: DOWNSTREAM_URLS
+              value: ""
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8010
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8010
+            initialDelaySeconds: 30
+            periodSeconds: 15

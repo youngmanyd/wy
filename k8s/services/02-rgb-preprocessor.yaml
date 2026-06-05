@@ -1,0 +1,84 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rgb-preprocessor
+  namespace: uav-edge
+  labels:
+    app: rgb-preprocessor
+    tier: uav-edge
+spec:
+  selector:
+    app: rgb-preprocessor
+  ports:
+    - port: 8002
+      targetPort: 8002
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rgb-preprocessor
+  namespace: uav-edge
+  labels:
+    app: rgb-preprocessor
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rgb-preprocessor
+  template:
+    metadata:
+      labels:
+        app: rgb-preprocessor
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: "uav-node1"
+      containers:
+        - name: rgb-preprocessor
+          image: uav-edge-preprocessor:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8002
+          env:
+            - name: SERVICE_ROLE
+              value: "rgb-preprocessor"
+            - name: SERVICE_PORT
+              value: "8002"
+            - name: DOWNSTREAM_URLS
+              value: "http://rgb-detector.uav-edge.svc.cluster.local:8004"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: TARGET_PREPROC_PAYLOAD
+              value: "204800"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 30
+            periodSeconds: 15

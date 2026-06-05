@@ -1,0 +1,83 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: object-tracker
+  namespace: uav-edge
+  labels:
+    app: object-tracker
+    tier: uav-edge
+spec:
+  selector:
+    app: object-tracker
+  ports:
+    - port: 8007
+      targetPort: 8007
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: object-tracker
+  namespace: uav-edge
+  labels:
+    app: object-tracker
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: object-tracker
+  template:
+    metadata:
+      labels:
+        app: object-tracker
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8007"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Node3: capable UAV (4 CPU / 8GB)
+      nodeSelector:
+        kubernetes.io/hostname: "uav-node3"
+      containers:
+        - name: object-tracker
+          image: uav-edge-compute:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8007
+          env:
+            - name: SERVICE_ROLE
+              value: "object-tracker"
+            - name: SERVICE_PORT
+              value: "8007"
+            - name: DOWNSTREAM_URLS
+              value: "http://decision-maker.uav-edge.svc.cluster.local:8009"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "256Mi"
+            limits:
+              cpu: "600m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8007
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8007
+            initialDelaySeconds: 30
+            periodSeconds: 15

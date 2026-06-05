@@ -1,0 +1,87 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ir-detector
+  namespace: uav-edge
+  labels:
+    app: ir-detector
+    tier: uav-edge
+spec:
+  selector:
+    app: ir-detector
+  ports:
+    - port: 8005
+      targetPort: 8005
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ir-detector
+  namespace: uav-edge
+  labels:
+    app: ir-detector
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ir-detector
+  template:
+    metadata:
+      labels:
+        app: ir-detector
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8005"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Node1: medium UAV (2 CPU / 4GB)
+      nodeSelector:
+        kubernetes.io/hostname: "uav-node1"
+      containers:
+        - name: ir-detector
+          image: uav-edge-detector:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8005
+          env:
+            - name: SERVICE_ROLE
+              value: "ir-detector"
+            - name: SERVICE_PORT
+              value: "8005"
+            - name: DOWNSTREAM_URLS
+              value: "http://feature-fusion.uav-edge.svc.cluster.local:8006"
+            - name: ONNX_MODEL_PATH
+              value: "/app/models/yolov8n.onnx"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: TARGET_DETECT_PAYLOAD
+              value: "819200"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "384Mi"
+            limits:
+              cpu: "800m"
+              memory: "768Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 30
+            periodSeconds: 15

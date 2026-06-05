@@ -1,0 +1,85 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ir-preprocessor
+  namespace: uav-edge
+  labels:
+    app: ir-preprocessor
+    tier: uav-edge
+spec:
+  selector:
+    app: ir-preprocessor
+  ports:
+    - port: 8003
+      targetPort: 8003
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ir-preprocessor
+  namespace: uav-edge
+  labels:
+    app: ir-preprocessor
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ir-preprocessor
+  template:
+    metadata:
+      labels:
+        app: ir-preprocessor
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8003"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Node2: most constrained (1 CPU / 2GB)
+      nodeSelector:
+        kubernetes.io/hostname: "uav-node2"
+      containers:
+        - name: ir-preprocessor
+          image: uav-edge-preprocessor:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8003
+          env:
+            - name: SERVICE_ROLE
+              value: "ir-preprocessor"
+            - name: SERVICE_PORT
+              value: "8003"
+            - name: DOWNSTREAM_URLS
+              value: "http://ir-detector.uav-edge.svc.cluster.local:8005"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: TARGET_PREPROC_PAYLOAD
+              value: "204800"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "384Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 30
+            periodSeconds: 15

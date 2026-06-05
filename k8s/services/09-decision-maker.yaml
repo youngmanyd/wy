@@ -1,0 +1,84 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decision-maker
+  namespace: uav-edge
+  labels:
+    app: decision-maker
+    tier: uav-edge
+spec:
+  selector:
+    app: decision-maker
+  ports:
+    - port: 8009
+      targetPort: 8009
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decision-maker
+  namespace: uav-edge
+  labels:
+    app: decision-maker
+    tier: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: decision-maker
+  template:
+    metadata:
+      labels:
+        app: decision-maker
+        tier: uav-edge
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8009"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: "true"
+      containers:
+        - name: decision-maker
+          image: uav-edge-compute:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8009
+          env:
+            - name: SERVICE_ROLE
+              value: "decision-maker"
+            - name: SERVICE_PORT
+              value: "8009"
+            - name: DOWNSTREAM_URLS
+              value: "http://telemetry-dashboard.uav-edge.svc.cluster.local:8010"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
+            - name: FUSION_TIMEOUT
+              value: "5.0"
+            - name: HTTP_TIMEOUT
+              value: "10.0"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8009
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8009
+            initialDelaySeconds: 30
+            periodSeconds: 15
