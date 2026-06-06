@@ -1,16 +1,8 @@
-# =============================================================================
-# Dashboard image: base + OpenCV (for image annotation rendering)
-# Used by: telemetry-dashboard
-# Serves the real-time Web UI at /
-# =============================================================================
 ARG BASE_IMAGE=uav-edge-base:latest
 FROM ${BASE_IMAGE}
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && \
-    rm -rf /var/lib/apt/lists/*
+ARG SERVICE_NAME=telemetry-dashboard
+COPY services/common.py /app/common.py
+COPY services/${SERVICE_NAME}/app.py /app/app.py
 
-COPY requirements/preprocessor.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
-
-COPY src/app.py /app/app.py
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

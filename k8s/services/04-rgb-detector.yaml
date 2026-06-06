@@ -1,4 +1,3 @@
----
 apiVersion: v1
 kind: Service
 metadata:
@@ -6,25 +5,19 @@ metadata:
   namespace: uav-edge
   labels:
     app: rgb-detector
-    tier: uav-edge
 spec:
   selector:
     app: rgb-detector
   ports:
     - port: 8004
-      targetPort: 8004
+      targetPort: 8000
       protocol: TCP
-      name: http
-  type: ClusterIP
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rgb-detector
   namespace: uav-edge
-  labels:
-    app: rgb-detector
-    tier: uav-edge
 spec:
   replicas: 1
   selector:
@@ -34,38 +27,28 @@ spec:
     metadata:
       labels:
         app: rgb-detector
-        tier: uav-edge
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8004"
-        prometheus.io/path: "/metrics"
     spec:
-      # Node3: most capable UAV (4 CPU / 8GB)
       nodeSelector:
-        kubernetes.io/hostname: "uav-node3"
+        kubernetes.io/hostname: uav-node3
       containers:
         - name: rgb-detector
-          image: uav-edge-detector:latest
-          imagePullPolicy: IfNotPresent
+          image: uav-edge-rgb-detector:latest
+          imagePullPolicy: Never
           ports:
-            - containerPort: 8004
+            - containerPort: 8000
           env:
             - name: SERVICE_ROLE
               value: "rgb-detector"
             - name: SERVICE_PORT
-              value: "8004"
+              value: "8000"
             - name: DOWNSTREAM_URLS
-              value: "http://feature-fusion.uav-edge.svc.cluster.local:8006"
+              value: "http://feature-fusion:8006"
             - name: ONNX_MODEL_PATH
               value: "/app/models/yolov8n.onnx"
             - name: OMP_NUM_THREADS
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
-            - name: TARGET_DETECT_PAYLOAD
-              value: "819200"
-            - name: HTTP_TIMEOUT
-              value: "10.0"
+              value: "http://jaeger:4317"
           resources:
             requests:
               cpu: "500m"
@@ -73,15 +56,3 @@ spec:
             limits:
               cpu: "1000m"
               memory: "1024Mi"
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8004
-            initialDelaySeconds: 15
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8004
-            initialDelaySeconds: 30
-            periodSeconds: 15

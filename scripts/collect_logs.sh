@@ -1,47 +1,26 @@
 #!/usr/bin/env bash
 # =============================================================================
-# UAV Edge — CSV Telemetry Log Collection Script
-# Extracts CSV_RESULT: lines from telemetry-dashboard pods.
-#
-# Usage:
-#   ./collect_logs.sh [--output experiment_results.csv] [--follow]
+# collect_logs.sh — Collect CSV experiment results from telemetry-dashboard
 # =============================================================================
 set -euo pipefail
 
-NAMESPACE="${NAMESPACE:-uav-edge}"
-OUTPUT="experiment_results.csv"
-FOLLOW=false
+OUTPUT="${1:-experiment_results.csv}"
+NAMESPACE="uav-edge"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --output|-o) OUTPUT="$2"; shift 2 ;;
-        --follow|-f) FOLLOW=true; shift ;;
-        --namespace|-n) NAMESPACE="$2"; shift 2 ;;
-        *) echo "Unknown arg: $1"; exit 1 ;;
-    esac
-done
+HEADER="request_id,e2e_ms,rgb_branch_ms,ir_branch_ms"
+HEADER+=",gateway_compute_ms,rgb_preproc_compute_ms,ir_preproc_compute_ms"
+HEADER+=",rgb_detect_compute_ms,ir_detect_compute_ms,fusion_compute_ms"
+HEADER+=",tracker_compute_ms,sa_compute_ms,decision_compute_ms,dashboard_compute_ms"
+HEADER+=",net_gw_rgb,net_gw_ir,net_rgb_rgbd,net_ir_ird"
+HEADER+=",net_rgbd_fusion,net_ird_fusion,net_fusion_tracker,net_fusion_sa"
+HEADER+=",net_tracker_dm,net_sa_dm,net_dm_dashboard"
 
-CSV_HEADER="request_id,e2e_ms,rgb_branch_ms,ir_branch_ms"
-CSV_HEADER+=",gateway_compute_ms,rgb_preprocessor_compute_ms,ir_preprocessor_compute_ms"
-CSV_HEADER+=",rgb_detector_compute_ms,ir_detector_compute_ms,feature_fusion_compute_ms"
-CSV_HEADER+=",object_tracker_compute_ms,situation_awareness_compute_ms,decision_maker_compute_ms"
-CSV_HEADER+=",telemetry_dashboard_compute_ms"
-CSV_HEADER+=",net_gateway_rgb_preproc_ms,net_gateway_ir_preproc_ms"
-CSV_HEADER+=",net_rgb_preproc_rgb_det_ms,net_ir_preproc_ir_det_ms"
-CSV_HEADER+=",net_rgb_det_fusion_ms,net_ir_det_fusion_ms"
-CSV_HEADER+=",net_fusion_tracker_ms,net_fusion_sa_ms"
-CSV_HEADER+=",net_tracker_decision_ms,net_sa_decision_ms"
-CSV_HEADER+=",net_decision_dashboard_ms"
+echo "$HEADER" > "$OUTPUT"
 
-if $FOLLOW; then
-    echo "Live-following telemetry-dashboard logs... (Ctrl+C to stop)"
-    echo "$CSV_HEADER"
-    kubectl logs -l app=telemetry-dashboard -n "$NAMESPACE" -f --tail=0 2>/dev/null | \
-        grep --line-buffered 'CSV_RESULT:' | sed 's/.*CSV_RESULT://'
-else
-    echo "$CSV_HEADER" > "$OUTPUT"
-    kubectl logs -l app=telemetry-dashboard -n "$NAMESPACE" --tail=-1 2>/dev/null | \
-        grep 'CSV_RESULT:' | sed 's/.*CSV_RESULT://' >> "$OUTPUT"
-    LINES=$(wc -l < "$OUTPUT")
-    echo "Collected $((LINES - 1)) results -> ${OUTPUT}"
-fi
+echo "Collecting CSV results from telemetry-dashboard pods..."
+kubectl logs -n "$NAMESPACE" -l app=telemetry-dashboard --tail=-1 2>/dev/null | \
+    grep "^CSV_RESULT:" | \
+    sed 's/^CSV_RESULT://' >> "$OUTPUT"
+
+LINES=$(wc -l < "$OUTPUT")
+echo "Collected $((LINES - 1)) result rows -> $OUTPUT"

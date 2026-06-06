@@ -1,28 +1,17 @@
-# =============================================================================
-# Detector image: base + OpenCV + ONNXRuntime + YOLOv8n model
-# Used by: rgb-detector, ir-detector
-# Largest image (~400MB with model) — deployed only to capable nodes (Node1/Node3)
-# =============================================================================
 ARG BASE_IMAGE=uav-edge-base:latest
 FROM ${BASE_IMAGE}
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && \
-    rm -rf /var/lib/apt/lists/*
 
 COPY requirements/detector.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
-# Download YOLOv8n ONNX model
-RUN mkdir -p /app/models && \
-    (curl -fSL -o /app/models/yolov8n.onnx \
-      "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n.onnx" || \
-     (pip install --no-cache-dir ultralytics && \
-      python -c "from ultralytics import YOLO; m=YOLO('yolov8n.pt'); m.export(format='onnx',imgsz=640)" && \
-      mv yolov8n.onnx /app/models/yolov8n.onnx && \
-      pip uninstall -y ultralytics torch torchvision) || \
-     echo "WARN: Model not available — mount at /app/models/yolov8n.onnx")
+RUN pip install --no-cache-dir ultralytics && \
+    python -c "from ultralytics import YOLO; m = YOLO('yolov8n.pt'); m.export(format='onnx', imgsz=640)" && \
+    mkdir -p /app/models && mv yolov8n.onnx /app/models/ && \
+    pip uninstall -y ultralytics torch torchvision torchaudio && \
+    rm -rf /root/.cache /tmp/* yolov8n.pt
 
-ENV ONNX_MODEL_PATH=/app/models/yolov8n.onnx
+ARG SERVICE_NAME=rgb-detector
+COPY services/common.py /app/common.py
+COPY services/${SERVICE_NAME}/app.py /app/app.py
 
-COPY src/app.py /app/app.py
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

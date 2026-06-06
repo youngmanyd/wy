@@ -1,69 +1,58 @@
 #!/usr/bin/env bash
 # =============================================================================
-# UAV Edge — K3s One-Click Deployment Script
-# Applies all microservice YAMLs and observability stack.
-#
-# Usage:
-#   ./deploy.sh [--namespace uav-edge] [--dry-run]
+# deploy.sh — Deploy all UAV Edge microservices and observability stack to K3s
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-NAMESPACE="${NAMESPACE:-uav-edge}"
-DRY_RUN=""
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --namespace) NAMESPACE="$2"; shift 2 ;;
-        --dry-run) DRY_RUN="--dry-run=client"; shift ;;
-        *) echo "Unknown arg: $1"; exit 1 ;;
-    esac
-done
+echo "=========================================="
+echo "UAV Edge Microservices K3s Deployment"
+echo "=========================================="
 
-echo "============================================================"
-echo "  UAV Edge — K3s Deployment"
-echo "  Namespace: ${NAMESPACE}"
-echo "============================================================"
-
-# Create namespace if not exists
-kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-
+# Step 1: Create namespace
 echo ""
-echo "--- Deploying Observability Stack ---"
-kubectl apply -f "${PROJECT_DIR}/k8s/observability/" -n "$NAMESPACE" $DRY_RUN
-echo ""
+echo "[1/4] Creating namespace uav-edge..."
+kubectl create namespace uav-edge 2>/dev/null || echo "  Namespace already exists"
 
-echo "--- Deploying Microservices (10 services) ---"
-for yaml in "${PROJECT_DIR}"/k8s/services/*.yaml; do
+# Step 2: Deploy observability stack
+echo ""
+echo "[2/4] Deploying observability stack..."
+kubectl apply -f "$PROJECT_DIR/k8s/observability/observability-stack.yaml"
+
+# Step 3: Deploy microservices
+echo ""
+echo "[3/4] Deploying 10 microservices..."
+for yaml in "$PROJECT_DIR"/k8s/services/*.yaml; do
     svc_name=$(basename "$yaml" .yaml)
-    echo "  Applying: ${svc_name}"
-    kubectl apply -f "$yaml" $DRY_RUN
-done
-echo ""
-
-echo "--- Waiting for Deployments to become Ready ---"
-SERVICES=(
-    gateway rgb-preprocessor ir-preprocessor
-    rgb-detector ir-detector feature-fusion
-    object-tracker situation-awareness decision-maker
-    telemetry-dashboard
-)
-for svc in "${SERVICES[@]}"; do
-    echo -n "  Waiting for ${svc}... "
-    kubectl rollout status deployment/"$svc" -n "$NAMESPACE" --timeout=120s 2>/dev/null && echo "Ready" || echo "TIMEOUT"
+    echo "  -> $svc_name"
+    kubectl apply -f "$yaml"
 done
 
+# Step 4: Verify
 echo ""
-echo "============================================================"
-echo "  Deployment Complete!"
-echo "============================================================"
+echo "[4/4] Waiting for pods to be ready..."
+sleep 5
 echo ""
-echo "Service Status:"
-kubectl get pods -n "$NAMESPACE" -o wide | head -20
+echo "Pod status:"
+kubectl get pods -n uav-edge -o wide
 echo ""
-echo "Access Points:"
-echo "  Dashboard:    kubectl port-forward svc/telemetry-dashboard 8010:8010 -n $NAMESPACE"
-echo "  Jaeger UI:    kubectl port-forward svc/jaeger 16686:16686 -n $NAMESPACE"
-echo "  Prometheus:   kubectl port-forward svc/prometheus 9090:9090 -n $NAMESPACE"
-echo "  Gateway API:  kubectl port-forward svc/gateway 8001:8001 -n $NAMESPACE"
+echo "Services:"
+kubectl get svc -n uav-edge
+echo ""
+echo "=========================================="
+echo "Deployment complete!"
+echo ""
+echo "Dashboard access:"
+echo "  kubectl port-forward -n uav-edge svc/telemetry-dashboard 8010:8010"
+echo "  Then open http://localhost:8010"
+echo ""
+echo "Jaeger UI:"
+echo "  kubectl port-forward -n uav-edge svc/jaeger 16686:16686"
+echo "  Then open http://localhost:16686"
+echo ""
+echo "Prometheus:"
+echo "  kubectl port-forward -n uav-edge svc/prometheus 9090:9090"
+echo "  Then open http://localhost:9090"
+echo "=========================================="

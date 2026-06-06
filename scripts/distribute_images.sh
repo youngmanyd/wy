@@ -1,135 +1,88 @@
 #!/usr/bin/env bash
 # =============================================================================
-# UAV Edge — Offline Image Distribution Script
-# Transfers pre-built tar images to edge nodes via SCP and imports via ctr.
-#
-# K3s uses containerd (ctr) as its container runtime.
-# Images are imported into the k8s.io namespace for K3s compatibility.
-#
-# Usage:
-#   ./distribute_images.sh [--images-dir ./images]
-#
-# Environment variables (configure your cluster):
-#   MASTER_HOST   - Master node SSH address (default: master)
-#   NODE1_HOST    - UAV Node1 SSH address (default: uav-node1)
-#   NODE2_HOST    - UAV Node2 SSH address (default: uav-node2)
-#   NODE3_HOST    - UAV Node3 SSH address (default: uav-node3)
-#   SSH_USER      - SSH username (default: root)
-#   SSH_KEY       - Path to SSH private key (optional)
-#   REMOTE_TMP    - Remote temp directory (default: /tmp/uav-images)
+# distribute_images.sh — Export Docker images as tar.gz and import via ctr
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-IMAGES_DIR="${IMAGES_DIR:-${PROJECT_DIR}/images}"
+DIST_DIR="${SCRIPT_DIR}/../dist"
+mkdir -p "$DIST_DIR"
 
-# Cluster node addresses (override with env vars)
-MASTER_HOST="${MASTER_HOST:-master}"
-NODE1_HOST="${NODE1_HOST:-uav-node1}"
-NODE2_HOST="${NODE2_HOST:-uav-node2}"
-NODE3_HOST="${NODE3_HOST:-uav-node3}"
+# Node list — edit these to match your environment
+NODES=("uav-node1" "uav-node2" "uav-node3")
 SSH_USER="${SSH_USER:-root}"
 SSH_KEY="${SSH_KEY:-}"
-REMOTE_TMP="${REMOTE_TMP:-/tmp/uav-images}"
+REMOTE_TMP="/tmp/uav-images"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --images-dir) IMAGES_DIR="$2"; shift 2 ;;
-        *) echo "Unknown arg: $1"; exit 1 ;;
-    esac
-done
+# Map services to target nodes
+declare -A SVC_NODES
+SVC_NODES["gateway"]="MASTER"
+SVC_NODES["rgb-preprocessor"]="uav-node1"
+SVC_NODES["ir-preprocessor"]="uav-node2"
+SVC_NODES["rgb-detector"]="uav-node3"
+SVC_NODES["ir-detector"]="uav-node1"
+SVC_NODES["feature-fusion"]="MASTER"
+SVC_NODES["object-tracker"]="uav-node3"
+SVC_NODES["situation-awareness"]="uav-node2"
+SVC_NODES["decision-maker"]="MASTER"
+SVC_NODES["telemetry-dashboard"]="MASTER"
 
-# Build SSH command
-SSH_CMD="ssh"
-SCP_CMD="scp"
-if [ -n "$SSH_KEY" ]; then
-    SSH_CMD="ssh -i $SSH_KEY"
-    SCP_CMD="scp -i $SSH_KEY"
-fi
+ALL_SERVICES=("gateway" "rgb-preprocessor" "ir-preprocessor" "rgb-detector" "ir-detector" \
+              "feature-fusion" "object-tracker" "situation-awareness" "decision-maker" "telemetry-dashboard")
 
-echo "============================================================"
-echo "  UAV Edge — Offline Image Distribution"
-echo "  Images Dir:  ${IMAGES_DIR}"
-echo "  SSH User:    ${SSH_USER}"
-echo "============================================================"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+[ -n "$SSH_KEY" ] && SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
 
-# Verify images exist
-if [ ! -d "$IMAGES_DIR" ]; then
-    echo "ERROR: Images directory not found: $IMAGES_DIR"
-    echo "Run ./scripts/build_images.sh first."
-    exit 1
-fi
+echo "=========================================="
+echo "Exporting Docker images to tar.gz"
+echo "=========================================="
 
-# ---------------------------------------------------------------------------
-# Node-to-image mapping:
-#   Master: base, compute, dashboard (gateway, feature-fusion, decision-maker, telemetry-dashboard)
-#   Node1:  base, preprocessor, detector (rgb-preprocessor, ir-detector)
-#   Node2:  base, compute, preprocessor (ir-preprocessor, situation-awareness)
-#   Node3:  base, compute, detector (rgb-detector, object-tracker)
-# ---------------------------------------------------------------------------
-declare -A NODE_IMAGES
-NODE_IMAGES["$MASTER_HOST"]="uav-edge-base uav-edge-compute uav-edge-dashboard"
-NODE_IMAGES["$NODE1_HOST"]="uav-edge-base uav-edge-preprocessor uav-edge-detector"
-NODE_IMAGES["$NODE2_HOST"]="uav-edge-base uav-edge-compute uav-edge-preprocessor"
-NODE_IMAGES["$NODE3_HOST"]="uav-edge-base uav-edge-compute uav-edge-detector"
-
-# Transfer and import function
-distribute_to_node() {
-    local host="$1"
-    local images="$2"
-
-    echo ""
-    echo "--- Distributing to ${host} ---"
-
-    # Create remote temp dir
-    $SSH_CMD ${SSH_USER}@${host} "mkdir -p ${REMOTE_TMP}" 2>/dev/null || true
-
-    for img_name in $images; do
-        local tarfile="${IMAGES_DIR}/${img_name}.tar"
-        if [ ! -f "$tarfile" ]; then
-            echo "  WARN: ${tarfile} not found, skipping"
-            continue
-        fi
-
-        local size=$(du -h "$tarfile" | cut -f1)
-        echo "  [SCP] ${img_name}.tar (${size}) -> ${host}:${REMOTE_TMP}/"
-        $SCP_CMD "$tarfile" "${SSH_USER}@${host}:${REMOTE_TMP}/${img_name}.tar"
-
-        echo "  [CTR] Importing ${img_name} into containerd (k8s.io namespace)..."
-        $SSH_CMD ${SSH_USER}@${host} \
-            "sudo ctr -n k8s.io image import ${REMOTE_TMP}/${img_name}.tar && \
-             echo '  OK: ${img_name} imported' && \
-             rm -f ${REMOTE_TMP}/${img_name}.tar"
-    done
-
-    # Verify images on node
-    echo "  Verifying images on ${host}..."
-    $SSH_CMD ${SSH_USER}@${host} "sudo ctr -n k8s.io images ls | grep uav-edge || true"
-}
-
-# Execute distribution
-for host in "$MASTER_HOST" "$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST"; do
-    images="${NODE_IMAGES[$host]}"
-    distribute_to_node "$host" "$images"
+for svc in "${ALL_SERVICES[@]}"; do
+    IMG="uav-edge-${svc}:latest"
+    TAR="${DIST_DIR}/uav-edge-${svc}.tar.gz"
+    if [ -f "$TAR" ]; then
+        echo "  [skip] $TAR already exists"
+    else
+        echo "  [export] $IMG -> $TAR"
+        docker save "$IMG" | gzip > "$TAR"
+    fi
 done
 
 echo ""
-echo "============================================================"
-echo "  Distribution Complete!"
-echo "============================================================"
+echo "=========================================="
+echo "Importing images on local master (ctr)"
+echo "=========================================="
+for svc in "${ALL_SERVICES[@]}"; do
+    NODE="${SVC_NODES[$svc]}"
+    if [ "$NODE" == "MASTER" ]; then
+        TAR="${DIST_DIR}/uav-edge-${svc}.tar.gz"
+        echo "  [import] uav-edge-${svc}:latest on MASTER"
+        sudo ctr -n k8s.io images import <(gunzip -c "$TAR") 2>/dev/null || \
+        sudo k3s ctr images import <(gunzip -c "$TAR") 2>/dev/null || \
+        echo "    WARNING: ctr import failed for $svc on master"
+    fi
+done
+
 echo ""
-echo "Image layout per node:"
-echo "  Master ($MASTER_HOST): uav-edge-compute, uav-edge-dashboard"
-echo "    -> gateway, feature-fusion, decision-maker, telemetry-dashboard"
+echo "=========================================="
+echo "Distributing images to worker nodes via SCP"
+echo "=========================================="
+for svc in "${ALL_SERVICES[@]}"; do
+    NODE="${SVC_NODES[$svc]}"
+    if [ "$NODE" != "MASTER" ]; then
+        TAR="${DIST_DIR}/uav-edge-${svc}.tar.gz"
+        echo "  [scp] $TAR -> ${NODE}:${REMOTE_TMP}/"
+        ssh $SSH_OPTS "${SSH_USER}@${NODE}" "mkdir -p ${REMOTE_TMP}" 2>/dev/null || true
+        scp $SSH_OPTS "$TAR" "${SSH_USER}@${NODE}:${REMOTE_TMP}/" 2>/dev/null
+        echo "  [import] ctr import on ${NODE}"
+        ssh $SSH_OPTS "${SSH_USER}@${NODE}" \
+            "gunzip -c ${REMOTE_TMP}/uav-edge-${svc}.tar.gz | sudo ctr -n k8s.io images import - || \
+             gunzip -c ${REMOTE_TMP}/uav-edge-${svc}.tar.gz | sudo k3s ctr images import -" 2>/dev/null || \
+            echo "    WARNING: import failed for $svc on $NODE"
+    fi
+done
+
 echo ""
-echo "  Node1 ($NODE1_HOST): uav-edge-preprocessor, uav-edge-detector"
-echo "    -> rgb-preprocessor, ir-detector"
-echo ""
-echo "  Node2 ($NODE2_HOST): uav-edge-compute, uav-edge-preprocessor"
-echo "    -> ir-preprocessor, situation-awareness"
-echo ""
-echo "  Node3 ($NODE3_HOST): uav-edge-compute, uav-edge-detector"
-echo "    -> rgb-detector, object-tracker"
-echo ""
-echo "Next: kubectl apply -f k8s/services/ -f k8s/observability/"
+echo "=========================================="
+echo "Done. Images distributed to all nodes."
+echo "=========================================="

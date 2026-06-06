@@ -4,7 +4,7 @@
 # Components: Jaeger (tracing), Prometheus (metrics), Kubenurse (network RTT)
 # =============================================================================
 
-# ---- Jaeger All-in-One ----
+# ---- Jaeger (v2.17.0 — unified binary) ----
 apiVersion: v1
 kind: Service
 metadata:
@@ -48,25 +48,12 @@ spec:
         node-role.kubernetes.io/master: "true"
       containers:
         - name: jaeger
-          image: jaegertracing/all-in-one:1.62
+          image: docker.io/jaegertracing/jaeger:2.17.0
+          imagePullPolicy: Never
           ports:
             - containerPort: 4317
             - containerPort: 4318
             - containerPort: 16686
-          env:
-            - name: COLLECTOR_OTLP_ENABLED
-              value: "true"
-            - name: SPAN_STORAGE_TYPE
-              value: "badger"
-            - name: BADGER_EPHEMERAL
-              value: "false"
-            - name: BADGER_DIRECTORY_VALUE
-              value: "/badger/data"
-            - name: BADGER_DIRECTORY_KEY
-              value: "/badger/key"
-          volumeMounts:
-            - name: badger-data
-              mountPath: /badger
           resources:
             requests:
               cpu: 200m
@@ -74,9 +61,6 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
-      volumes:
-        - name: badger-data
-          emptyDir: {}
 ---
 # ---- Prometheus ----
 apiVersion: v1
@@ -190,6 +174,7 @@ spec:
       containers:
         - name: prometheus
           image: prom/prometheus:v2.54.1
+          imagePullPolicy: Never
           args:
             - '--config.file=/etc/prometheus/prometheus.yml'
             - '--storage.tsdb.path=/prometheus'
@@ -285,6 +270,7 @@ spec:
       containers:
         - name: kubenurse
           image: postfinance/kubenurse:v1.13.0
+          imagePullPolicy: Never
           ports:
             - containerPort: 8080
               hostPort: 8080

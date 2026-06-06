@@ -1,4 +1,3 @@
----
 apiVersion: v1
 kind: Service
 metadata:
@@ -6,25 +5,20 @@ metadata:
   namespace: uav-edge
   labels:
     app: telemetry-dashboard
-    tier: uav-edge
 spec:
   selector:
     app: telemetry-dashboard
   ports:
     - port: 8010
-      targetPort: 8010
+      targetPort: 8000
       protocol: TCP
-      name: http
-  type: ClusterIP
+  type: NodePort
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: telemetry-dashboard
   namespace: uav-edge
-  labels:
-    app: telemetry-dashboard
-    tier: uav-edge
 spec:
   replicas: 1
   selector:
@@ -34,49 +28,26 @@ spec:
     metadata:
       labels:
         app: telemetry-dashboard
-        tier: uav-edge
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8010"
-        prometheus.io/path: "/metrics"
     spec:
       nodeSelector:
         node-role.kubernetes.io/master: "true"
       containers:
         - name: telemetry-dashboard
-          image: uav-edge-dashboard:latest
-          imagePullPolicy: IfNotPresent
+          image: uav-edge-telemetry-dashboard:latest
+          imagePullPolicy: Never
           ports:
-            - containerPort: 8010
+            - containerPort: 8000
           env:
             - name: SERVICE_ROLE
               value: "telemetry-dashboard"
             - name: SERVICE_PORT
-              value: "8010"
-            - name: DOWNSTREAM_URLS
-              value: ""
-            - name: OMP_NUM_THREADS
-              value: "1"
+              value: "8000"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://jaeger.uav-edge.svc.cluster.local:4317"
-            - name: HTTP_TIMEOUT
-              value: "10.0"
+              value: "http://jaeger:4317"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "300m"
+              cpu: "200m"
               memory: "256Mi"
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8010
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8010
-            initialDelaySeconds: 30
-            periodSeconds: 15
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
