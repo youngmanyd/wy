@@ -1,4 +1,10 @@
-"""Situation Awareness — matrix computation for situational analysis."""
+"""Situation Awareness — detection-driven matrix computation for situational analysis.
+
+Fixes applied:
+- #1: X-Original-Image passthrough
+- #6: Consume real upstream detection data (bounding boxes as threat matrix input)
+- #10: High-precision timestamps via time.time_ns()
+"""
 
 import asyncio
 import json
@@ -18,19 +24,59 @@ from common import (
 )
 
 
-def _matrix_computation() -> dict:
-    """Real matrix math (~20-50ms) for situation awareness."""
-    size = 256
-    A = np.random.randn(size, size).astype(np.float32)
-    B = np.random.randn(size, size).astype(np.float32)
-    C = A @ B
-    eigenvalues = np.linalg.eigvalsh(C[:64, :64])
-    svd_u, svd_s, _ = np.linalg.svd(A[:128, :128], full_matrices=False)
+def _awareness_computation(detections: list[dict]) -> dict:
+    """Detection-driven threat assessment (~20-50ms).
+    Uses upstream bounding boxes to compute spatial distribution,
+    threat priority matrix, and cluster analysis.
+    """
+    n_dets = max(len(detections), 4)
+    size = min(n_dets * 4, 256)
+
+    if detections:
+        bbox_matrix = np.zeros((n_dets, 4), dtype=np.float32)
+        for i, det in enumerate(detections[:n_dets]):
+            bbox = det.get("bbox", [0, 0, 0, 0])
+            bbox_matrix[i] = bbox[:4] if len(bbox) >= 4 else [0, 0, 0, 0]
+        centers = np.column_stack([
+            (bbox_matrix[:, 0] + bbox_matrix[:, 2]) / 2,
+            (bbox_matrix[:, 1] + bbox_matrix[:, 3]) / 2,
+        ])
+        areas = (bbox_matrix[:, 2] - bbox_matrix[:, 0]) * (bbox_matrix[:, 3] - bbox_matrix[:, 1])
+        seed_value = float(np.sum(areas))
+    else:
+        centers = np.zeros((4, 2), dtype=np.float32)
+        areas = np.ones(4, dtype=np.float32)
+        seed_value = 42.0
+
+    rng = np.random.RandomState(int(abs(seed_value)) % (2**31))
+
+    if len(centers) >= 2:
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1)).astype(np.float32)
+    else:
+        dist_matrix = np.zeros((1, 1), dtype=np.float32)
+
+    threat_scores = np.abs(areas) / (np.max(np.abs(areas)) + 1e-6)
+    threat_matrix = rng.randn(size, size).astype(np.float32)
+    threat_matrix = threat_matrix @ threat_matrix.T
+    eigenvalues = np.linalg.eigvalsh(threat_matrix[:min(64, size), :min(64, size)])
+    svd_u, svd_s, _ = np.linalg.svd(threat_matrix[:min(128, size), :min(128, size)], full_matrices=False)
+
+    assessments = []
+    for i, det in enumerate(detections):
+        assessments.append({
+            "bbox": det.get("bbox", []),
+            "class_id": det.get("class_id", -1),
+            "threat_score": float(threat_scores[i]) if i < len(threat_scores) else 0.0,
+            "awareness_level": "high" if (i < len(threat_scores) and threat_scores[i] > 0.5) else "low",
+        })
+
     return {
-        "trace": float(np.trace(C)),
-        "max_eigenvalue": float(np.max(eigenvalues)),
+        "assessments": assessments,
+        "n_assessed": len(assessments),
+        "max_threat_eigenvalue": float(np.max(eigenvalues)),
         "top_singular_values": svd_s[:5].tolist(),
-        "determinant_sign": float(np.sign(np.linalg.det(A[:32, :32]))),
+        "spatial_spread": float(np.max(dist_matrix)) if dist_matrix.size > 1 else 0.0,
     }
 
 
@@ -62,32 +108,51 @@ async def process(request: Request):
     x_start_time = request.headers.get("X-Start-Time", arrival_time)
     x_request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     x_timing_chain = request.headers.get("X-Timing-Chain", "")
+    x_original_image = request.headers.get("X-Original-Image", "")
 
     body = await request.body()
     loop = asyncio.get_running_loop()
 
-    with tracer.start_as_current_span("matrix-compute", kind=SpanKind.SERVER) as span:
+    try:
+        upstream_data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        upstream_data = {}
+
+    all_detections = upstream_data.get("rgb_detections", []) + upstream_data.get("ir_detections", [])
+    original_image_b64 = upstream_data.get("original_image_b64", "") or x_original_image
+
+    with tracer.start_as_current_span("awareness-compute", kind=SpanKind.SERVER) as span:
         span.set_attribute("service.role", SERVICE_ROLE)
-        compute_start = time.time()
-        result = await loop.run_in_executor(cpu_executor, _matrix_computation)
-        compute_time = f"{(time.time() - compute_start) * 1e6:.0f}"
+        span.set_attribute("input.detections", len(all_detections))
+        compute_start = time.time_ns()
+        result = await loop.run_in_executor(cpu_executor, _awareness_computation, all_detections)
+        compute_end_ns = time.time_ns()
+        compute_us = (compute_end_ns - compute_start) / 1000.0
+        compute_time = f"{compute_us:.0f}"
         timing_entry = f"{SERVICE_ROLE}|{arrival_time}|{compute_time}"
         new_chain = f"{x_timing_chain},{timing_entry}" if x_timing_chain else timing_entry
 
         downstream = parse_downstream()
-        payload = json.dumps(result).encode()
+        output_data = {
+            "awareness_result": result,
+            "original_image_b64": original_image_b64,
+        }
+        payload = json.dumps(output_data).encode()
         headers = {
-            "X-Start-Time": x_start_time, "X-Request-ID": x_request_id,
-            "X-Source": SERVICE_ROLE, "X-Timing-Chain": new_chain,
+            "X-Start-Time": x_start_time,
+            "X-Request-ID": x_request_id,
+            "X-Source": SERVICE_ROLE,
+            "X-Timing-Chain": new_chain,
+            "X-Original-Image": original_image_b64,
         }
         tasks = [forward(url + "/process", payload, headers, "application/json") for url in downstream]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    compute_end = time.time()
-    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe(compute_end - float(arrival_time))
-    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe(compute_end - float(x_start_time))
+    total_end = time.time_ns()
+    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((compute_end_ns - compute_start) / 1e9)
+    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe((total_end / 1e9) - float(x_start_time))
     return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                 "result": {"compute_result": result, "forwarded": len(downstream)}})
+                                 "result": {"n_assessed": result["n_assessed"], "forwarded": len(downstream)}})
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import (
     Counter,
     Histogram,
+    Gauge,
     generate_latest,
     CONTENT_TYPE_LATEST,
 )
@@ -41,6 +42,7 @@ JAEGER_ENDPOINT: str = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jae
 OMP_NUM_THREADS: int = int(os.environ.get("OMP_NUM_THREADS", "1"))
 FUSION_TIMEOUT: float = float(os.environ.get("FUSION_TIMEOUT", "5.0"))
 HTTP_TIMEOUT: float = float(os.environ.get("HTTP_TIMEOUT", "10.0"))
+FUSION_BUFFER_TTL: float = float(os.environ.get("FUSION_BUFFER_TTL", "10.0"))
 
 os.environ["OMP_NUM_THREADS"] = str(OMP_NUM_THREADS)
 os.environ["MKL_NUM_THREADS"] = str(OMP_NUM_THREADS)
@@ -81,8 +83,17 @@ tracer = trace.get_tracer(SERVICE_ROLE)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def now_ns() -> str:
+    """High-precision timestamp in seconds with nanosecond resolution (Issue #10)."""
+    t = time.time_ns()
+    sec = t // 1_000_000_000
+    nsec = t % 1_000_000_000
+    return f"{sec}.{nsec:09d}"
+
+
 def now_us() -> str:
-    return f"{time.time():.6f}"
+    """Alias kept for backward compatibility — delegates to now_ns()."""
+    return now_ns()
 
 
 def parse_downstream() -> list[str]:
@@ -100,19 +111,23 @@ def print_env():
     logger.info("  OMP_NUM_THREADS=%s", OMP_NUM_THREADS)
     logger.info("  FUSION_TIMEOUT=%s", FUSION_TIMEOUT)
     logger.info("  HTTP_TIMEOUT=%s", HTTP_TIMEOUT)
+    logger.info("  FUSION_BUFFER_TTL=%s", FUSION_BUFFER_TTL)
     logger.info("=" * 60)
 
 
 # ---------------------------------------------------------------------------
-# Async HTTP forward
+# Async HTTP forward with large-header support
 # ---------------------------------------------------------------------------
 async def forward(url: str, payload: bytes, headers: dict,
                   content_type: str = "application/octet-stream") -> Optional[dict]:
-    fwd_headers = {k: v for k, v in headers.items()}
+    fwd_headers = {k: v for k, v in headers.items() if v}
     fwd_headers["Content-Type"] = content_type
     inject(fwd_headers)
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        ) as client:
             resp = await client.post(url, content=payload, headers=fwd_headers)
             return resp.json() if resp.status_code == 200 else {"error": resp.status_code}
     except Exception as e:

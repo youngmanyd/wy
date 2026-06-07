@@ -1,7 +1,12 @@
-"""IR Pre-processor — OpenCV resize + normalize for infrared images."""
+"""IR Pre-processor — OpenCV resize + normalize for infrared images.
+
+Fixes applied:
+- #1: X-Original-Image passthrough from upstream
+- #8: Truncation warning logging when image data is clipped
+- #10: High-precision timestamps via time.time_ns()
+"""
 
 import asyncio
-import base64
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -27,6 +32,7 @@ def _preprocess_image(img_bytes: bytes) -> bytes:
     arr = np.frombuffer(img_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
+        logger.warning("[WARNING] Failed to decode input image (size=%d bytes), using synthetic fallback", len(img_bytes))
         img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
     img_resized = cv2.resize(img, (640, 640), interpolation=cv2.INTER_LINEAR)
     img_norm = img_resized.astype(np.float32) / 255.0
@@ -35,6 +41,7 @@ def _preprocess_image(img_bytes: bytes) -> bytes:
     tensor_bytes = img_uint8.tobytes()
     usable = TARGET_PREPROC_PAYLOAD - 4
     if len(tensor_bytes) > usable:
+        logger.warning("[WARNING] Preprocessor data truncation: tensor %d bytes > target %d bytes, clipping", len(tensor_bytes), usable)
         tensor_bytes = tensor_bytes[:usable]
     header = len(tensor_bytes).to_bytes(4, "big")
     payload = header + tensor_bytes
@@ -46,6 +53,7 @@ def _preprocess_image(img_bytes: bytes) -> bytes:
 @asynccontextmanager
 async def lifespan(application):
     print_env()
+    logger.info("  TARGET_PREPROC_PAYLOAD=%s", TARGET_PREPROC_PAYLOAD)
     logger.info("Service %s ready on port %d", SERVICE_ROLE, SERVICE_PORT)
     yield
     cpu_executor.shutdown(wait=False)
@@ -71,31 +79,35 @@ async def process(request: Request):
     x_start_time = request.headers.get("X-Start-Time", arrival_time)
     x_request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     x_timing_chain = request.headers.get("X-Timing-Chain", "")
+    x_original_image = request.headers.get("X-Original-Image", "")
 
     body = await request.body()
     loop = asyncio.get_running_loop()
 
     with tracer.start_as_current_span("preprocess", kind=SpanKind.SERVER) as span:
         span.set_attribute("service.role", SERVICE_ROLE)
-        compute_start = time.time()
+        compute_start = time.time_ns()
         processed = await loop.run_in_executor(cpu_executor, _preprocess_image, body)
-        compute_time = f"{(time.time() - compute_start) * 1e6:.0f}"
+        compute_end_ns = time.time_ns()
+        compute_us = (compute_end_ns - compute_start) / 1000.0
+        compute_time = f"{compute_us:.0f}"
         timing_entry = f"{SERVICE_ROLE}|{arrival_time}|{compute_time}"
         new_chain = f"{x_timing_chain},{timing_entry}" if x_timing_chain else timing_entry
 
         downstream = parse_downstream()
-        orig_b64 = base64.b64encode(body).decode() if len(body) < 500_000 else ""
         headers = {
-            "X-Start-Time": x_start_time, "X-Request-ID": x_request_id,
-            "X-Source": SERVICE_ROLE, "X-Timing-Chain": new_chain,
-            "X-Original-Image": orig_b64,
+            "X-Start-Time": x_start_time,
+            "X-Request-ID": x_request_id,
+            "X-Source": SERVICE_ROLE,
+            "X-Timing-Chain": new_chain,
+            "X-Original-Image": x_original_image,
         }
         tasks = [forward(url + "/process", processed, headers) for url in downstream]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    compute_end = time.time()
-    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe(compute_end - float(arrival_time))
-    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe(compute_end - float(x_start_time))
+    total_end = time.time_ns()
+    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((compute_end_ns - compute_start) / 1e9)
+    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe((total_end / 1e9) - float(x_start_time))
     return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
                                  "result": {"preprocessed_size": len(processed), "forwarded": len(downstream)}})
 
