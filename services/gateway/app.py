@@ -1,16 +1,14 @@
-"""Gateway microservice — entry point for the UAV Edge DAG.
+"""Gateway — entry point for the UAV Edge DAG.
 
-Fixes applied:
-- #1: X-Original-Image passthrough (base64 of raw input image)
-- #5: Measure real compute time (header construction, base64 encoding, dispatch scheduling)
-- #10: High-precision timestamps via time.time_ns()
-- #11: No shared mutable state in gateway (stateless)
+OTel architecture:
+- SERVER span: auto-created by FastAPIInstrumentor
+- INTERNAL span: wraps body read + image encoding (pure computation)
+- CLIENT spans: auto-created by HTTPXInstrumentor for each downstream call
+- Forward calls are OUTSIDE the INTERNAL span
 """
 
 import asyncio
 import base64
-import time
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Request
@@ -18,16 +16,14 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from common import (
     SERVICE_ROLE, SERVICE_PORT, cpu_executor, tracer,
-    REQUEST_COUNT, COMPUTE_LATENCY, REQUEST_LATENCY,
-    now_us, parse_downstream, print_env, forward,
-    create_app, SpanKind, logger,
+    REQUEST_COUNT, PAYLOAD_BYTES,
+    parse_downstream, print_env, forward,
+    create_app, SpanKind, logger, trace,
 )
 
 
 def _encode_image_b64(body: bytes) -> str:
-    """Encode raw image body to base64 for X-Original-Image passthrough.
-    Offloaded to thread pool to avoid blocking event loop (base64 is CPU-bound for large images).
-    """
+    """Encode raw image bytes to base64 (CPU-bound, offloaded to executor)."""
     return base64.b64encode(body).decode("ascii")
 
 
@@ -53,50 +49,38 @@ async def root():
 
 @app.post("/process")
 async def process(request: Request):
-    arrival_time = now_us()
     REQUEST_COUNT.labels(service_role=SERVICE_ROLE).inc()
-
-    x_start_time = request.headers.get("X-Start-Time", arrival_time)
-    x_request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    x_timing_chain = request.headers.get("X-Timing-Chain", "")
-
     body = await request.body()
+
+    # Record incoming payload on auto-created SERVER span
+    server_span = trace.get_current_span()
+    if server_span and server_span.is_recording():
+        server_span.set_attribute("messaging.payload_size_bytes", len(body))
+
     loop = asyncio.get_running_loop()
 
-    with tracer.start_as_current_span("gateway-dispatch", kind=SpanKind.SERVER):
-        compute_start = time.time_ns()
-
+    # --- INTERNAL span: pure computation (base64 encoding) ---
+    with tracer.start_as_current_span("compute:encode_image_b64", kind=SpanKind.INTERNAL) as ispan:
+        ispan.set_attribute("input_size_bytes", len(body))
         orig_b64 = await loop.run_in_executor(cpu_executor, _encode_image_b64, body)
+        ispan.set_attribute("b64_length", len(orig_b64))
 
-        downstream = parse_downstream()
-        headers = {
-            "X-Start-Time": x_start_time,
-            "X-Request-ID": x_request_id,
-            "X-Source": "gateway",
-            "X-Original-Image": orig_b64,
-        }
+    # --- Forward to downstream (OUTSIDE INTERNAL span) ---
+    # CLIENT spans are auto-created by HTTPXInstrumentor
+    downstream = parse_downstream()
+    if not downstream:
+        return JSONResponse(content={"role": SERVICE_ROLE, "result": "no_downstream"})
 
-        compute_end_ns = time.time_ns()
-        compute_us = (compute_end_ns - compute_start) / 1000.0
-        compute_time = f"{compute_us:.0f}"
-        timing_entry = f"gateway|{arrival_time}|{compute_time}"
-        new_chain = f"{x_timing_chain},{timing_entry}" if x_timing_chain else timing_entry
-        headers["X-Timing-Chain"] = new_chain
+    # Gateway sends raw image bytes as body to preprocessors.
+    # The orig_b64 is NOT sent in headers (forbidden). Preprocessors will
+    # base64-encode the raw bytes themselves and carry it through the body chain.
+    tasks = [forward(url + "/process", body) for url in downstream]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        if not downstream:
-            return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                         "result": {"status": "no_downstream"}})
-
-        tasks = [forward(url + "/process", body, headers) for url in downstream]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    total_end = time.time_ns()
-    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((total_end - compute_start) / 1e9)
-    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe(
-        (total_end / 1e9) - float(x_start_time)
-    )
-    return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                 "result": {"forwarded_to": downstream, "results_count": len(results)}})
+    return JSONResponse(content={
+        "role": SERVICE_ROLE,
+        "result": {"forwarded_to": downstream, "results_count": len(results)},
+    })
 
 
 if __name__ == "__main__":

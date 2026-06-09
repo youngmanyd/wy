@@ -1,15 +1,17 @@
-"""Object Tracker — real detection-driven matrix computation for tracking.
+"""Object Tracker — Kalman filter-based multi-object tracking.
 
-Fixes applied:
-- #1: X-Original-Image passthrough
-- #6: Consume real upstream detection data (bounding boxes as matrix input)
-- #10: High-precision timestamps via time.time_ns()
+Consumes fused detection JSON from feature-fusion, performs tracking
+computation (matrix operations), forwards results to decision-maker.
+
+OTel architecture:
+- SERVER span: auto (FastAPIInstrumentor)
+- INTERNAL span: wraps tracking computation
+- CLIENT span: auto (HTTPXInstrumentor)
+- Forward calls OUTSIDE the INTERNAL span
 """
 
 import asyncio
 import json
-import time
-import uuid
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -18,62 +20,50 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from common import (
     SERVICE_ROLE, SERVICE_PORT, cpu_executor, tracer,
-    REQUEST_COUNT, COMPUTE_LATENCY, REQUEST_LATENCY,
-    now_us, parse_downstream, print_env, forward,
-    create_app, SpanKind, logger,
+    REQUEST_COUNT, PAYLOAD_BYTES,
+    parse_downstream, print_env, forward,
+    create_app, SpanKind, logger, trace,
 )
 
 
-def _tracking_computation(detections: list[dict]) -> dict:
-    """Detection-driven matrix math (~20-50ms).
-    Uses upstream bounding boxes as seeds for state transition matrix,
-    Kalman filter prediction, and data association via Hungarian method.
-    """
-    n_dets = max(len(detections), 4)
-    state_dim = max(n_dets * 4, 16)
-    size = min(state_dim, 256)
+def _tracking_computation(data: dict) -> dict:
+    """Kalman filter + Hungarian matching (CPU-bound matrix operations)."""
+    all_dets = data.get("rgb_detections", []) + data.get("ir_detections", [])
+    n = max(len(all_dets), 4)
 
-    if detections:
-        bbox_matrix = np.zeros((n_dets, 4), dtype=np.float32)
-        for i, det in enumerate(detections[:n_dets]):
-            bbox = det.get("bbox", [0, 0, 0, 0])
-            bbox_matrix[i] = bbox[:4] if len(bbox) >= 4 else [0, 0, 0, 0]
-        seed_value = float(np.sum(bbox_matrix))
-    else:
-        seed_value = 42.0
+    state_matrix = np.eye(4 * n, dtype=np.float32)
+    for i, det in enumerate(all_dets):
+        bbox = det.get("bbox", [0, 0, 0, 0])
+        if len(bbox) >= 4:
+            state_matrix[i * 4:(i + 1) * 4, 0] = bbox[:4]
 
-    rng = np.random.RandomState(int(abs(seed_value)) % (2**31))
-    F = np.eye(size, dtype=np.float32) + rng.randn(size, size).astype(np.float32) * 0.01
-    Q = np.eye(size, dtype=np.float32) * 0.1
-    state = rng.randn(size, 1).astype(np.float32)
-    predicted_state = F @ state
-    P = F @ Q @ F.T + Q
+    # Kalman prediction
+    F = np.eye(4 * n, dtype=np.float32)
+    for i in range(n):
+        if i * 4 + 3 < 4 * n:
+            F[i * 4, i * 4 + 1] = 0.1
+            F[i * 4 + 2, i * 4 + 3] = 0.1
+    predicted = F @ state_matrix
 
-    if n_dets >= 2:
-        cost_matrix = rng.randn(n_dets, n_dets).astype(np.float32)
-        cost_matrix = cost_matrix @ cost_matrix.T
-        eigenvalues = np.linalg.eigvalsh(cost_matrix)
-    else:
-        eigenvalues = np.array([0.0])
+    # Cost matrix for Hungarian-like assignment
+    cost_matrix = np.random.rand(n, n).astype(np.float32)
+    for _ in range(5):
+        cost_matrix = cost_matrix @ cost_matrix.T + np.eye(n, dtype=np.float32) * 0.1
 
-    svd_u, svd_s, _ = np.linalg.svd(F[:min(128, size), :min(128, size)], full_matrices=False)
-
-    tracked_objects = []
-    for det in detections:
-        tracked_objects.append({
-            "bbox": det.get("bbox", []),
-            "class_id": det.get("class_id", -1),
-            "score": det.get("score", 0),
-            "track_state": "active",
-        })
+    tracked_objects = [
+        {
+            "track_id": i,
+            "bbox": all_dets[i]["bbox"] if i < len(all_dets) else [0, 0, 0, 0],
+            "score": all_dets[i].get("score", 0.0) if i < len(all_dets) else 0.0,
+            "state": predicted[i * 4:(i + 1) * 4, 0].tolist() if i * 4 + 4 <= predicted.shape[0] else [0, 0, 0, 0],
+        }
+        for i in range(min(n, len(all_dets)))
+    ]
 
     return {
         "tracked_objects": tracked_objects,
-        "n_tracked": len(tracked_objects),
-        "state_norm": float(np.linalg.norm(predicted_state)),
-        "max_eigenvalue": float(np.max(eigenvalues)),
-        "top_singular_values": svd_s[:5].tolist(),
-        "covariance_trace": float(np.trace(P)),
+        "total_tracked": len(tracked_objects),
+        "original_image_b64": data.get("original_image_b64", ""),
     }
 
 
@@ -99,57 +89,46 @@ async def root():
 
 @app.post("/process")
 async def process(request: Request):
-    arrival_time = now_us()
     REQUEST_COUNT.labels(service_role=SERVICE_ROLE).inc()
-
-    x_start_time = request.headers.get("X-Start-Time", arrival_time)
-    x_request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    x_timing_chain = request.headers.get("X-Timing-Chain", "")
-    x_original_image = request.headers.get("X-Original-Image", "")
-
     body = await request.body()
+
+    server_span = trace.get_current_span()
+    if server_span and server_span.is_recording():
+        server_span.set_attribute("messaging.payload_size_bytes", len(body))
+
+    # Parse JSON from fusion
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        data = {"rgb_detections": [], "ir_detections": []}
+
     loop = asyncio.get_running_loop()
 
-    try:
-        upstream_data = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        upstream_data = {}
+    # --- INTERNAL span: pure tracking computation ---
+    with tracer.start_as_current_span("compute:kalman_tracking", kind=SpanKind.INTERNAL) as ispan:
+        all_dets = data.get("rgb_detections", []) + data.get("ir_detections", [])
+        ispan.set_attribute("input.detections", len(all_dets))
+        result = await loop.run_in_executor(cpu_executor, _tracking_computation, data)
+        ispan.set_attribute("tracked_objects", result["total_tracked"])
 
-    all_detections = upstream_data.get("rgb_detections", []) + upstream_data.get("ir_detections", [])
-    original_image_b64 = upstream_data.get("original_image_b64", "") or x_original_image
+    # --- Forward OUTSIDE INTERNAL span ---
+    output_data = {
+        "tracked_objects": result["tracked_objects"],
+        "total_tracked": result["total_tracked"],
+        "rgb_detections": data.get("rgb_detections", []),
+        "ir_detections": data.get("ir_detections", []),
+        "original_image_b64": result.get("original_image_b64", ""),
+    }
+    payload = json.dumps(output_data).encode()
 
-    with tracer.start_as_current_span("tracking-compute", kind=SpanKind.SERVER) as span:
-        span.set_attribute("service.role", SERVICE_ROLE)
-        span.set_attribute("input.detections", len(all_detections))
-        compute_start = time.time_ns()
-        result = await loop.run_in_executor(cpu_executor, _tracking_computation, all_detections)
-        compute_end_ns = time.time_ns()
-        compute_us = (compute_end_ns - compute_start) / 1000.0
-        compute_time = f"{compute_us:.0f}"
-        timing_entry = f"{SERVICE_ROLE}|{arrival_time}|{compute_time}"
-        new_chain = f"{x_timing_chain},{timing_entry}" if x_timing_chain else timing_entry
+    downstream = parse_downstream()
+    tasks = [forward(url + "/process", payload, "application/json") for url in downstream]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-        downstream = parse_downstream()
-        output_data = {
-            "tracker_result": result,
-            "original_image_b64": original_image_b64,
-        }
-        payload = json.dumps(output_data).encode()
-        headers = {
-            "X-Start-Time": x_start_time,
-            "X-Request-ID": x_request_id,
-            "X-Source": SERVICE_ROLE,
-            "X-Timing-Chain": new_chain,
-            "X-Original-Image": original_image_b64,
-        }
-        tasks = [forward(url + "/process", payload, headers, "application/json") for url in downstream]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    total_end = time.time_ns()
-    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((compute_end_ns - compute_start) / 1e9)
-    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe((total_end / 1e9) - float(x_start_time))
-    return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                 "result": {"n_tracked": result["n_tracked"], "forwarded": len(downstream)}})
+    return JSONResponse(content={
+        "role": SERVICE_ROLE,
+        "result": {"tracked": result["total_tracked"]},
+    })
 
 
 if __name__ == "__main__":

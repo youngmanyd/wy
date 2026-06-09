@@ -1,89 +1,87 @@
-"""Decision Maker — fusion node merging object-tracker and situation-awareness.
+"""Decision Maker — second synchronization point (tracker + awareness).
 
-Fixes applied:
-- #1: X-Original-Image passthrough
-- #2: Fix negative network latency by using max(input arrivals) as fusion arrival time
-- #3: Parse upstream JSON correctly (tracker_result, awareness_result)
-- #4: TTL-based cleanup for fusion_buffers to prevent memory leaks
-- #10: High-precision timestamps via time.time_ns()
-- #11: asyncio.Lock for all shared buffer access
+Uses **trace-id** as the correlation key. SpanLinks connect both upstream paths.
+
+OTel architecture:
+- SERVER span: auto (FastAPIInstrumentor)
+- INTERNAL span: wraps decision logic (with SpanLinks)
+- CLIENT span: auto (HTTPXInstrumentor)
+- Forward calls OUTSIDE the INTERNAL span
 """
 
 import asyncio
 import json
 import time
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from common import (
-    SERVICE_ROLE, SERVICE_PORT, FUSION_TIMEOUT, FUSION_BUFFER_TTL,
-    cpu_executor, tracer,
-    REQUEST_COUNT, COMPUTE_LATENCY, REQUEST_LATENCY,
-    now_us, parse_downstream, print_env, forward,
-    create_app, SpanKind, Link, logger, trace, extract,
+    SERVICE_ROLE, SERVICE_PORT, cpu_executor, tracer,
+    REQUEST_COUNT, PAYLOAD_BYTES, FUSION_TIMEOUT, FUSION_BUFFER_TTL,
+    parse_downstream, print_env, forward,
+    create_app, SpanKind, Link, logger, trace,
+    get_current_trace_id,
 )
 
+# Decision synchronization state
 fusion_buffers: dict = {}
 fusion_events: dict = {}
 fusion_contexts: dict = {}
 fusion_timestamps: dict = {}
+
 _buffer_lock = asyncio.Lock()
 
 
-async def _wait_for_fusion(request_id: str, source: str, data: dict, otel_ctx, arrival_time: str):
-    """Wait for both branches to arrive. Returns merged data or None on timeout."""
-    async with _buffer_lock:
-        if request_id not in fusion_buffers:
-            fusion_buffers[request_id] = {}
-            fusion_events[request_id] = asyncio.Event()
-            fusion_contexts[request_id] = []
-            fusion_timestamps[request_id] = {"created": time.time(), "arrivals": []}
-
-        fusion_buffers[request_id][source] = data
-        fusion_contexts[request_id].append(otel_ctx)
-        fusion_timestamps[request_id]["arrivals"].append(float(arrival_time))
-
-        if len(fusion_buffers[request_id]) >= 2:
-            fusion_events[request_id].set()
-
-    try:
-        await asyncio.wait_for(fusion_events[request_id].wait(), timeout=FUSION_TIMEOUT)
-    except asyncio.TimeoutError:
-        logger.warning("Fusion timeout for request %s (source=%s)", request_id, source)
-        return None, arrival_time
-
-    async with _buffer_lock:
-        if request_id in fusion_buffers:
-            fused = fusion_buffers.pop(request_id)
-            fusion_events.pop(request_id, None)
-            ctx_list = fusion_contexts.pop(request_id, [])
-            ts_info = fusion_timestamps.pop(request_id, {"arrivals": [float(arrival_time)]})
-            max_arrival = max(ts_info["arrivals"])
-            max_arrival_str = f"{int(max_arrival)}.{int((max_arrival % 1) * 1e9):09d}"
-            return {"fused": fused, "contexts": ctx_list}, max_arrival_str
-        return None, arrival_time
-
-
 async def _cleanup_stale_buffers():
-    """Periodically clean up stale fusion buffers older than FUSION_BUFFER_TTL."""
     while True:
         await asyncio.sleep(FUSION_BUFFER_TTL)
-        now = time.time()
         async with _buffer_lock:
-            stale_keys = [
-                k for k, v in fusion_timestamps.items()
-                if now - v["created"] > FUSION_BUFFER_TTL
-            ]
-            for k in stale_keys:
-                fusion_buffers.pop(k, None)
-                fusion_events.pop(k, None)
-                fusion_contexts.pop(k, None)
-                fusion_timestamps.pop(k, None)
-            if stale_keys:
-                logger.info("Cleaned up %d stale fusion buffers", len(stale_keys))
+            now = time.monotonic()
+            stale = [tid for tid, ts in fusion_timestamps.items()
+                     if now - ts > FUSION_BUFFER_TTL]
+            for tid in stale:
+                fusion_buffers.pop(tid, None)
+                fusion_events.pop(tid, None)
+                fusion_contexts.pop(tid, None)
+                fusion_timestamps.pop(tid, None)
+            if stale:
+                logger.info("Cleaned %d stale decision buffers", len(stale))
+
+
+def _make_decision(merged: dict) -> dict:
+    """Decision logic (CPU-bound)."""
+    tracker_data = merged.get("tracker", {})
+    awareness_data = merged.get("awareness", {})
+
+    tracked = tracker_data.get("total_tracked", 0)
+    risk_level = awareness_data.get("risk_level", "LOW")
+    mean_threat = awareness_data.get("mean_threat_score", 0.0)
+
+    if risk_level == "HIGH" and tracked > 3:
+        decision = "EVADE"
+    elif risk_level == "MEDIUM" or tracked > 5:
+        decision = "ALERT"
+    elif tracked > 0:
+        decision = "MONITOR"
+    else:
+        decision = "CLEAR"
+
+    original_image_b64 = (tracker_data.get("original_image_b64", "")
+                          or awareness_data.get("original_image_b64", ""))
+
+    return {
+        "decision": decision,
+        "tracked_objects": tracked,
+        "risk_level": risk_level,
+        "mean_threat_score": round(mean_threat, 4),
+        "rgb_detections": tracker_data.get("rgb_detections", [])
+                          or awareness_data.get("rgb_detections", []),
+        "ir_detections": tracker_data.get("ir_detections", [])
+                         or awareness_data.get("ir_detections", []),
+        "original_image_b64": original_image_b64,
+    }
 
 
 @asynccontextmanager
@@ -93,10 +91,6 @@ async def lifespan(application):
     cleanup_task = asyncio.create_task(_cleanup_stale_buffers())
     yield
     cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
     cpu_executor.shutdown(wait=False)
     logger.info("Service %s shutting down", SERVICE_ROLE)
 
@@ -108,111 +102,84 @@ app = create_app(lifespan_func=lifespan)
 async def root():
     return HTMLResponse(
         content=f"<h1>UAV Edge Service: {SERVICE_ROLE}</h1>"
+        f"<p>Decision buffers: {len(fusion_buffers)}</p>"
         f"<p><a href='/health'>Health</a> | <a href='/metrics'>Metrics</a></p>"
     )
 
 
 @app.post("/process")
 async def process(request: Request):
-    arrival_time = now_us()
     REQUEST_COUNT.labels(service_role=SERVICE_ROLE).inc()
-
-    x_start_time = request.headers.get("X-Start-Time", arrival_time)
-    x_request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    x_source = request.headers.get("X-Source", "unknown")
-    x_timing_chain = request.headers.get("X-Timing-Chain", "")
-    x_original_image = request.headers.get("X-Original-Image", "")
-    incoming_ctx = extract(dict(request.headers))
-
     body = await request.body()
 
+    server_span = trace.get_current_span()
+    if server_span and server_span.is_recording():
+        server_span.set_attribute("messaging.payload_size_bytes", len(body))
+
+    trace_id = get_current_trace_id()
+    if not trace_id:
+        return JSONResponse(content={"role": SERVICE_ROLE, "error": "no_trace_id"})
+
+    current_span_ctx = trace.get_current_span().get_span_context()
+
     try:
-        upstream_data = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        upstream_data = {"raw_size": len(body), "source": x_source}
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        data = {}
 
-    data = {
-        "upstream": upstream_data,
-        "_arrival": arrival_time,
-        "_chain": x_timing_chain,
-        "_source": x_source,
-        "_original_image": upstream_data.get("original_image_b64", "") or x_original_image,
-    }
+    # Determine source: tracker vs awareness
+    async with _buffer_lock:
+        if trace_id not in fusion_buffers:
+            fusion_buffers[trace_id] = {}
+            fusion_events[trace_id] = asyncio.Event()
+            fusion_contexts[trace_id] = []
+            fusion_timestamps[trace_id] = time.monotonic()
+            source_key = "tracker"
+        else:
+            source_key = "awareness"
 
-    fused, effective_arrival = await _wait_for_fusion(
-        x_request_id, x_source, data, incoming_ctx, arrival_time
-    )
-    if fused is None:
-        return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                     "result": {"status": "waiting_or_timeout"}})
+        fusion_buffers[trace_id][source_key] = data
+        if current_span_ctx and current_span_ctx.is_valid:
+            fusion_contexts[trace_id].append(current_span_ctx)
 
-    links = []
-    for ctx in fused.get("contexts", []):
-        upstream_span = trace.get_current_span(ctx)
-        if upstream_span and upstream_span.get_span_context().is_valid:
-            links.append(Link(upstream_span.get_span_context()))
+        if len(fusion_buffers[trace_id]) >= 2:
+            fusion_events[trace_id].set()
 
-    with tracer.start_as_current_span(f"fusion-{SERVICE_ROLE}", kind=SpanKind.SERVER, links=links) as span:
-        span.set_attribute("service.role", SERVICE_ROLE)
-        span.set_attribute("fusion.sources", str(list(fused["fused"].keys())))
-        compute_start = time.time_ns()
+    try:
+        await asyncio.wait_for(fusion_events[trace_id].wait(), timeout=FUSION_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("Decision timeout for trace_id=%s", trace_id[:16])
 
-        chains = []
-        original_image_b64 = ""
-        tracker_result = {}
-        awareness_result = {}
-        for src_key, src_data in fused["fused"].items():
-            if isinstance(src_data, dict):
-                if "_chain" in src_data:
-                    chains.append(src_data["_chain"])
-                upstream = src_data.get("upstream", {})
-                if "tracker_result" in upstream:
-                    tracker_result = upstream["tracker_result"]
-                if "awareness_result" in upstream:
-                    awareness_result = upstream["awareness_result"]
-                if src_data.get("_original_image") and not original_image_b64:
-                    original_image_b64 = src_data["_original_image"]
+    async with _buffer_lock:
+        merged = fusion_buffers.pop(trace_id, {})
+        links_ctx = fusion_contexts.pop(trace_id, [])
+        fusion_events.pop(trace_id, None)
+        fusion_timestamps.pop(trace_id, None)
 
-        merged_chain = ";".join(chains)
-        decision_result = {
-            "sources": list(fused["fused"].keys()),
-            "n_tracked": tracker_result.get("n_tracked", 0),
-            "n_assessed": awareness_result.get("n_assessed", 0),
-            "tracked_objects": tracker_result.get("tracked_objects", []),
-            "assessments": awareness_result.get("assessments", []),
-            "decision": "proceed" if tracker_result.get("n_tracked", 0) > 0 else "hold",
-            "original_image_b64": original_image_b64,
-        }
+    if len(merged) < 2:
+        return JSONResponse(content={"role": SERVICE_ROLE, "error": "incomplete_decision"})
 
-        compute_end_ns = time.time_ns()
-        compute_us = (compute_end_ns - compute_start) / 1000.0
-        compute_time = f"{compute_us:.0f}"
-        timing_entry = f"{SERVICE_ROLE}|{effective_arrival}|{compute_time}"
-        new_chain = f"{merged_chain},{timing_entry}" if merged_chain else timing_entry
+    links = [Link(ctx) for ctx in links_ctx if ctx.is_valid]
+    loop = asyncio.get_running_loop()
 
-        downstream = parse_downstream()
-        if not downstream:
-            COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((compute_end_ns - compute_start) / 1e9)
-            return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                         "result": decision_result})
+    # --- INTERNAL span: pure decision computation (with SpanLinks) ---
+    with tracer.start_as_current_span("compute:decision_logic", kind=SpanKind.INTERNAL, links=links) as ispan:
+        result = await loop.run_in_executor(cpu_executor, _make_decision, merged)
+        ispan.set_attribute("decision", result["decision"])
+        ispan.set_attribute("tracked_objects", result["tracked_objects"])
+        ispan.set_attribute("risk_level", result["risk_level"])
 
-        fused_payload = json.dumps(decision_result).encode()
-        headers = {
-            "X-Start-Time": x_start_time,
-            "X-Request-ID": x_request_id,
-            "X-Source": SERVICE_ROLE,
-            "X-Timing-Chain": new_chain,
-            "X-Original-Image": original_image_b64,
-        }
-        tasks = [forward(url + "/process", fused_payload, headers, "application/json") for url in downstream]
-        await asyncio.gather(*tasks, return_exceptions=True)
+    # --- Forward OUTSIDE INTERNAL span ---
+    payload = json.dumps(result).encode()
+    downstream = parse_downstream()
+    tasks = [forward(url + "/process", payload, "application/json") for url in downstream]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-    total_end = time.time_ns()
-    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((compute_end_ns - compute_start) / 1e9)
-    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe((total_end / 1e9) - float(x_start_time))
-    return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                 "result": {"decision": decision_result["decision"],
-                                            "forwarded": len(downstream)}})
+    return JSONResponse(content={
+        "role": SERVICE_ROLE,
+        "result": {"decision": result["decision"],
+                    "tracked": result["tracked_objects"]},
+    })
 
 
 if __name__ == "__main__":

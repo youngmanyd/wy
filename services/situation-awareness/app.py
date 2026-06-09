@@ -1,15 +1,18 @@
-"""Situation Awareness — detection-driven matrix computation for situational analysis.
+"""Situation Awareness — threat assessment and risk evaluation.
 
-Fixes applied:
-- #1: X-Original-Image passthrough
-- #6: Consume real upstream detection data (bounding boxes as threat matrix input)
-- #10: High-precision timestamps via time.time_ns()
+Consumes fused detection JSON from feature-fusion, performs threat
+evaluation (matrix operations), forwards results to decision-maker.
+
+OTel architecture:
+- SERVER span: auto (FastAPIInstrumentor)
+- INTERNAL span: wraps awareness computation
+- CLIENT span: auto (HTTPXInstrumentor)
+- Forward calls OUTSIDE the INTERNAL span
 """
 
 import asyncio
 import json
-import time
-import uuid
+import math
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -18,66 +21,59 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from common import (
     SERVICE_ROLE, SERVICE_PORT, cpu_executor, tracer,
-    REQUEST_COUNT, COMPUTE_LATENCY, REQUEST_LATENCY,
-    now_us, parse_downstream, print_env, forward,
-    create_app, SpanKind, logger,
+    REQUEST_COUNT, PAYLOAD_BYTES,
+    parse_downstream, print_env, forward,
+    create_app, SpanKind, logger, trace,
 )
 
 
-def _awareness_computation(detections: list[dict]) -> dict:
-    """Detection-driven threat assessment (~20-50ms).
-    Uses upstream bounding boxes to compute spatial distribution,
-    threat priority matrix, and cluster analysis.
-    """
-    n_dets = max(len(detections), 4)
-    size = min(n_dets * 4, 256)
+def _awareness_computation(data: dict) -> dict:
+    """Threat assessment + risk evaluation (CPU-bound matrix operations)."""
+    all_dets = data.get("rgb_detections", []) + data.get("ir_detections", [])
+    n = max(len(all_dets), 4)
 
-    if detections:
-        bbox_matrix = np.zeros((n_dets, 4), dtype=np.float32)
-        for i, det in enumerate(detections[:n_dets]):
-            bbox = det.get("bbox", [0, 0, 0, 0])
-            bbox_matrix[i] = bbox[:4] if len(bbox) >= 4 else [0, 0, 0, 0]
-        centers = np.column_stack([
-            (bbox_matrix[:, 0] + bbox_matrix[:, 2]) / 2,
-            (bbox_matrix[:, 1] + bbox_matrix[:, 3]) / 2,
-        ])
-        areas = (bbox_matrix[:, 2] - bbox_matrix[:, 0]) * (bbox_matrix[:, 3] - bbox_matrix[:, 1])
-        seed_value = float(np.sum(areas))
+    # Distance matrix
+    positions = np.zeros((n, 2), dtype=np.float32)
+    for i, det in enumerate(all_dets):
+        bbox = det.get("bbox", [0, 0, 0, 0])
+        if len(bbox) >= 4:
+            positions[i, 0] = (bbox[0] + bbox[2]) / 2
+            positions[i, 1] = (bbox[1] + bbox[3]) / 2
+
+    diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+    dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1))
+
+    # Threat scoring
+    threat_scores = np.zeros(n, dtype=np.float32)
+    for i, det in enumerate(all_dets):
+        score = det.get("score", 0.5)
+        area = 1.0
+        bbox = det.get("bbox", [0, 0, 0, 0])
+        if len(bbox) >= 4:
+            area = max(1.0, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+        proximity = np.sum(1.0 / (dist_matrix[i] + 1.0))
+        threat_scores[i] = score * math.log1p(area) * proximity
+
+    # Risk level
+    mean_threat = float(np.mean(threat_scores[:len(all_dets)])) if all_dets else 0.0
+    if mean_threat > 5.0:
+        risk_level = "HIGH"
+    elif mean_threat > 2.0:
+        risk_level = "MEDIUM"
     else:
-        centers = np.zeros((4, 2), dtype=np.float32)
-        areas = np.ones(4, dtype=np.float32)
-        seed_value = 42.0
+        risk_level = "LOW"
 
-    rng = np.random.RandomState(int(abs(seed_value)) % (2**31))
-
-    if len(centers) >= 2:
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1)).astype(np.float32)
-    else:
-        dist_matrix = np.zeros((1, 1), dtype=np.float32)
-
-    threat_scores = np.abs(areas) / (np.max(np.abs(areas)) + 1e-6)
-    threat_matrix = rng.randn(size, size).astype(np.float32)
-    threat_matrix = threat_matrix @ threat_matrix.T
-    eigenvalues = np.linalg.eigvalsh(threat_matrix[:min(64, size), :min(64, size)])
-    svd_u, svd_s, _ = np.linalg.svd(threat_matrix[:min(128, size), :min(128, size)], full_matrices=False)
-
-    assessments = []
-    for i, det in enumerate(detections):
-        assessments.append({
-            "bbox": det.get("bbox", []),
-            "class_id": det.get("class_id", -1),
-            "threat_score": float(threat_scores[i]) if i < len(threat_scores) else 0.0,
-            "awareness_level": "high" if (i < len(threat_scores) and threat_scores[i] > 0.5) else "low",
-        })
-
-    return {
-        "assessments": assessments,
-        "n_assessed": len(assessments),
-        "max_threat_eigenvalue": float(np.max(eigenvalues)),
-        "top_singular_values": svd_s[:5].tolist(),
-        "spatial_spread": float(np.max(dist_matrix)) if dist_matrix.size > 1 else 0.0,
+    assessment = {
+        "risk_level": risk_level,
+        "mean_threat_score": round(mean_threat, 4),
+        "total_objects": len(all_dets),
+        "threat_breakdown": [
+            {"index": i, "score": round(float(threat_scores[i]), 4)}
+            for i in range(min(len(all_dets), 10))
+        ],
+        "original_image_b64": data.get("original_image_b64", ""),
     }
+    return assessment
 
 
 @asynccontextmanager
@@ -102,57 +98,48 @@ async def root():
 
 @app.post("/process")
 async def process(request: Request):
-    arrival_time = now_us()
     REQUEST_COUNT.labels(service_role=SERVICE_ROLE).inc()
-
-    x_start_time = request.headers.get("X-Start-Time", arrival_time)
-    x_request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    x_timing_chain = request.headers.get("X-Timing-Chain", "")
-    x_original_image = request.headers.get("X-Original-Image", "")
-
     body = await request.body()
-    loop = asyncio.get_running_loop()
+
+    server_span = trace.get_current_span()
+    if server_span and server_span.is_recording():
+        server_span.set_attribute("messaging.payload_size_bytes", len(body))
 
     try:
-        upstream_data = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        upstream_data = {}
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        data = {"rgb_detections": [], "ir_detections": []}
 
-    all_detections = upstream_data.get("rgb_detections", []) + upstream_data.get("ir_detections", [])
-    original_image_b64 = upstream_data.get("original_image_b64", "") or x_original_image
+    loop = asyncio.get_running_loop()
 
-    with tracer.start_as_current_span("awareness-compute", kind=SpanKind.SERVER) as span:
-        span.set_attribute("service.role", SERVICE_ROLE)
-        span.set_attribute("input.detections", len(all_detections))
-        compute_start = time.time_ns()
-        result = await loop.run_in_executor(cpu_executor, _awareness_computation, all_detections)
-        compute_end_ns = time.time_ns()
-        compute_us = (compute_end_ns - compute_start) / 1000.0
-        compute_time = f"{compute_us:.0f}"
-        timing_entry = f"{SERVICE_ROLE}|{arrival_time}|{compute_time}"
-        new_chain = f"{x_timing_chain},{timing_entry}" if x_timing_chain else timing_entry
+    # --- INTERNAL span: pure awareness computation ---
+    with tracer.start_as_current_span("compute:situation_assessment", kind=SpanKind.INTERNAL) as ispan:
+        all_dets = data.get("rgb_detections", []) + data.get("ir_detections", [])
+        ispan.set_attribute("input.detections", len(all_dets))
+        result = await loop.run_in_executor(cpu_executor, _awareness_computation, data)
+        ispan.set_attribute("risk_level", result["risk_level"])
+        ispan.set_attribute("mean_threat_score", result["mean_threat_score"])
 
-        downstream = parse_downstream()
-        output_data = {
-            "awareness_result": result,
-            "original_image_b64": original_image_b64,
-        }
-        payload = json.dumps(output_data).encode()
-        headers = {
-            "X-Start-Time": x_start_time,
-            "X-Request-ID": x_request_id,
-            "X-Source": SERVICE_ROLE,
-            "X-Timing-Chain": new_chain,
-            "X-Original-Image": original_image_b64,
-        }
-        tasks = [forward(url + "/process", payload, headers, "application/json") for url in downstream]
-        await asyncio.gather(*tasks, return_exceptions=True)
+    # --- Forward OUTSIDE INTERNAL span ---
+    output_data = {
+        "risk_level": result["risk_level"],
+        "mean_threat_score": result["mean_threat_score"],
+        "threat_breakdown": result["threat_breakdown"],
+        "rgb_detections": data.get("rgb_detections", []),
+        "ir_detections": data.get("ir_detections", []),
+        "original_image_b64": result.get("original_image_b64", ""),
+    }
+    payload = json.dumps(output_data).encode()
 
-    total_end = time.time_ns()
-    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((compute_end_ns - compute_start) / 1e9)
-    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe((total_end / 1e9) - float(x_start_time))
-    return JSONResponse(content={"role": SERVICE_ROLE, "request_id": x_request_id,
-                                 "result": {"n_assessed": result["n_assessed"], "forwarded": len(downstream)}})
+    downstream = parse_downstream()
+    tasks = [forward(url + "/process", payload, "application/json") for url in downstream]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    return JSONResponse(content={
+        "role": SERVICE_ROLE,
+        "result": {"risk_level": result["risk_level"],
+                    "mean_threat": result["mean_threat_score"]},
+    })
 
 
 if __name__ == "__main__":

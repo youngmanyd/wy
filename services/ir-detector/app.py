@@ -1,15 +1,17 @@
 """IR Detector — YOLOv8 ONNX inference on infrared image tensors.
 
-Fixes applied:
-- #1: X-Original-Image passthrough from upstream
-- #9: Graceful ONNX fallback to mock inference if model missing/corrupt
-- #10: High-precision timestamps via time.time_ns()
+Identical logic to RGB detector; separated for per-service image builds.
+
+OTel architecture:
+- SERVER span: auto (FastAPIInstrumentor)
+- INTERNAL span: wraps ONNX inference
+- CLIENT span: auto (HTTPXInstrumentor)
+- Forward calls OUTSIDE the INTERNAL span
 """
 
 import asyncio
 import json
-import time
-import uuid
+import os
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -17,13 +19,12 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from common import (
-    SERVICE_ROLE, SERVICE_PORT, cpu_executor, tracer,
-    REQUEST_COUNT, COMPUTE_LATENCY, REQUEST_LATENCY, OMP_NUM_THREADS,
-    now_us, parse_downstream, print_env, forward,
-    create_app, SpanKind, logger,
+    SERVICE_ROLE, SERVICE_PORT, cpu_executor, tracer, OMP_NUM_THREADS,
+    REQUEST_COUNT, PAYLOAD_BYTES,
+    parse_downstream, print_env, forward,
+    create_app, SpanKind, logger, trace,
 )
 
-import os
 ONNX_MODEL_PATH: str = os.environ.get("ONNX_MODEL_PATH", "/app/models/yolov8n.onnx")
 TARGET_DETECT_PAYLOAD: int = int(os.environ.get("TARGET_DETECT_PAYLOAD", str(800 * 1024)))
 
@@ -46,18 +47,35 @@ def _load_onnx_session():
         inference_mode = "real"
         return session
     except Exception as e:
-        logger.error("[FALLBACK] Failed to load ONNX model: %s — switching to mock inference", e)
+        logger.error("[FALLBACK] Failed to load ONNX model: %s — switching to mock", e)
         inference_mode = "mock"
         return None
 
 
-def _mock_detection() -> tuple[list[dict], bytes]:
-    """Mock inference generator when ONNX model is unavailable."""
+def _parse_preprocessor_payload(body: bytes) -> tuple[bytes, str]:
+    if len(body) < 4:
+        return body, ""
+    tensor_len = int.from_bytes(body[:4], "big")
+    tensor_bytes = body[4:4 + tensor_len]
+    offset = 4 + tensor_len
+    orig_b64 = ""
+    if offset + 4 <= len(body):
+        orig_b64_len = int.from_bytes(body[offset:offset + 4], "big")
+        if 0 < orig_b64_len <= len(body) - offset - 4:
+            try:
+                orig_b64 = body[offset + 4:offset + 4 + orig_b64_len].decode("ascii")
+            except (UnicodeDecodeError, ValueError):
+                pass
+    return tensor_bytes, orig_b64
+
+
+def _mock_detection(orig_b64: str) -> tuple[list[dict], bytes]:
     detections = [
-        {"bbox": [120.0, 80.0, 250.0, 220.0], "class_id": 0, "score": 0.78},
-        {"bbox": [350.0, 200.0, 500.0, 400.0], "class_id": 2, "score": 0.65},
+        {"bbox": [80.0, 60.0, 180.0, 160.0], "class_id": 2, "score": 0.78},
+        {"bbox": [250.0, 200.0, 400.0, 380.0], "class_id": 0, "score": 0.65},
     ]
-    det_json = json.dumps(detections).encode()
+    det_dict = {"detections": detections, "original_image_b64": orig_b64}
+    det_json = json.dumps(det_dict).encode()
     mock_tensor = np.random.randint(0, 255, (84, 8400), dtype=np.uint8).tobytes()
     header = len(det_json).to_bytes(4, "big")
     payload = header + det_json + mock_tensor
@@ -68,24 +86,19 @@ def _mock_detection() -> tuple[list[dict], bytes]:
     return detections, payload
 
 
-def _run_yolo_detection(tensor_bytes: bytes) -> tuple[list[dict], bytes]:
-    """Real YOLOv8 ONNX inference. Output ~TARGET_DETECT_PAYLOAD bytes."""
+def _run_yolo_detection(body: bytes) -> tuple[list[dict], bytes]:
+    tensor_bytes, orig_b64 = _parse_preprocessor_payload(body)
+
     global onnx_session
     if onnx_session is None:
-        return _mock_detection()
-
-    if len(tensor_bytes) >= 4:
-        tensor_len = int.from_bytes(tensor_bytes[:4], "big")
-        raw_uint8 = tensor_bytes[4:4 + tensor_len]
-    else:
-        raw_uint8 = tensor_bytes
+        return _mock_detection(orig_b64)
 
     total_elements = 3 * 640 * 640
-    if len(raw_uint8) >= total_elements:
-        img_uint8 = np.frombuffer(raw_uint8[:total_elements], dtype=np.uint8).reshape(3, 640, 640)
+    if len(tensor_bytes) >= total_elements:
+        img_uint8 = np.frombuffer(tensor_bytes[:total_elements], dtype=np.uint8).reshape(3, 640, 640)
     else:
         padded = np.zeros(total_elements, dtype=np.uint8)
-        padded[:len(raw_uint8)] = np.frombuffer(raw_uint8, dtype=np.uint8)
+        padded[:len(tensor_bytes)] = np.frombuffer(tensor_bytes, dtype=np.uint8)
         img_uint8 = padded.reshape(3, 640, 640)
     img_tensor = (img_uint8.astype(np.float32) / 255.0).reshape(1, 3, 640, 640)
 
@@ -110,7 +123,8 @@ def _run_yolo_detection(tensor_bytes: bytes) -> tuple[list[dict], bytes]:
                     "score": round(score, 4),
                 })
 
-    det_json = json.dumps(detections).encode()
+    det_dict = {"detections": detections, "original_image_b64": orig_b64}
+    det_json = json.dumps(det_dict).encode()
     output_slice = raw_output[0, :, :].tobytes()
     header = len(det_json).to_bytes(4, "big")
     payload = header + det_json + output_slice
@@ -150,48 +164,30 @@ async def root():
 
 @app.post("/process")
 async def process(request: Request):
-    arrival_time = now_us()
     REQUEST_COUNT.labels(service_role=SERVICE_ROLE).inc()
-
-    x_start_time = request.headers.get("X-Start-Time", arrival_time)
-    x_request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    x_timing_chain = request.headers.get("X-Timing-Chain", "")
-    x_original_image = request.headers.get("X-Original-Image", "")
-
     body = await request.body()
+
+    server_span = trace.get_current_span()
+    if server_span and server_span.is_recording():
+        server_span.set_attribute("messaging.payload_size_bytes", len(body))
+
     loop = asyncio.get_running_loop()
 
-    with tracer.start_as_current_span("yolo-detect", kind=SpanKind.SERVER) as span:
-        span.set_attribute("service.role", SERVICE_ROLE)
-        span.set_attribute("inference.mode", inference_mode)
-        compute_start = time.time_ns()
+    with tracer.start_as_current_span("compute:yolo_inference", kind=SpanKind.INTERNAL) as ispan:
+        ispan.set_attribute("inference.mode", inference_mode)
+        ispan.set_attribute("input_size_bytes", len(body))
         detections, payload = await loop.run_in_executor(cpu_executor, _run_yolo_detection, body)
-        compute_end_ns = time.time_ns()
-        compute_us = (compute_end_ns - compute_start) / 1000.0
-        compute_time = f"{compute_us:.0f}"
-        span.set_attribute("detections.count", len(detections))
-        timing_entry = f"{SERVICE_ROLE}|{arrival_time}|{compute_time}"
-        new_chain = f"{x_timing_chain},{timing_entry}" if x_timing_chain else timing_entry
+        ispan.set_attribute("detections.count", len(detections))
+        ispan.set_attribute("output_size_bytes", len(payload))
 
-        downstream = parse_downstream()
-        headers = {
-            "X-Start-Time": x_start_time,
-            "X-Request-ID": x_request_id,
-            "X-Source": SERVICE_ROLE,
-            "X-Timing-Chain": new_chain,
-            "X-Detections": json.dumps(detections),
-            "X-Original-Image": x_original_image,
-            "X-Inference-Mode": inference_mode,
-        }
-        tasks = [forward(url + "/process", payload, headers) for url in downstream]
-        await asyncio.gather(*tasks, return_exceptions=True)
+    downstream = parse_downstream()
+    tasks = [forward(url + "/process", payload) for url in downstream]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-    total_end = time.time_ns()
-    COMPUTE_LATENCY.labels(service_role=SERVICE_ROLE).observe((compute_end_ns - compute_start) / 1e9)
-    REQUEST_LATENCY.labels(service_role=SERVICE_ROLE).observe((total_end / 1e9) - float(x_start_time))
     return JSONResponse(content={
-        "role": SERVICE_ROLE, "request_id": x_request_id,
-        "result": {"detections": len(detections), "payload_size": len(payload), "inference_mode": inference_mode},
+        "role": SERVICE_ROLE,
+        "result": {"detections": len(detections), "payload_size": len(payload),
+                    "inference_mode": inference_mode},
     })
 
 
