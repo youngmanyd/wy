@@ -1,0 +1,2 @@
+# Additional deps for preprocessor & dashboard (OpenCV)
+opencv-python-headless==4.10.0.84

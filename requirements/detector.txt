@@ -1,0 +1,3 @@
+# Additional deps for detector nodes (OpenCV + ONNX Runtime)
+opencv-python-headless==4.10.0.84
+onnxruntime==1.20.1

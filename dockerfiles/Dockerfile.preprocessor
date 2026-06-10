@@ -1,0 +1,11 @@
+ARG BASE_IMAGE=uav-edge-base:latest
+FROM ${BASE_IMAGE}
+
+COPY requirements/preprocessor.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+
+ARG SERVICE_NAME=rgb-preprocessor
+COPY services/common.py /app/common.py
+COPY services/${SERVICE_NAME}/app.py /app/app.py
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

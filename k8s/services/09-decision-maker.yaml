@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: decision-maker
+  namespace: uav-edge
+  labels:
+    app: decision-maker
+spec:
+  selector:
+    app: decision-maker
+  ports:
+    - port: 8009
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decision-maker
+  namespace: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: decision-maker
+  template:
+    metadata:
+      labels:
+        app: decision-maker
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: "true"
+      containers:
+        - name: decision-maker
+          image: uav-edge-decision-maker:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: SERVICE_ROLE
+              value: "decision-maker"
+            - name: SERVICE_PORT
+              value: "8000"
+            - name: DOWNSTREAM_URLS
+              value: "http://telemetry-dashboard:8010"
+            - name: FUSION_TIMEOUT
+              value: "5.0"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
