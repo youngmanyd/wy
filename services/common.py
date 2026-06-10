@@ -81,7 +81,11 @@ resource = Resource.create({"service.name": SERVICE_ROLE})
 provider = TracerProvider(resource=resource)
 try:
     otlp_exporter = OTLPSpanExporter(endpoint=JAEGER_ENDPOINT, insecure=True)
-    provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+    provider.add_span_processor(BatchSpanProcessor(
+        otlp_exporter,
+        schedule_delay_millis=500,
+        max_export_batch_size=512,
+    ))
 except Exception as e:
     logger.warning("Failed to init OTLP exporter: %s", e)
 trace.set_tracer_provider(provider)

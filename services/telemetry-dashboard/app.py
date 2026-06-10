@@ -58,8 +58,10 @@ DAG_EDGES = [
     ("decision-maker", "telemetry-dashboard"),
 ]
 
+# Initial delay before first Jaeger query (allow BatchSpanProcessor to flush)
+INITIAL_QUERY_DELAY = 1.0
 # Backoff retry delays (seconds)
-BACKOFF_DELAYS = [0.5, 1.2, 2.4]
+BACKOFF_DELAYS = [1.5, 3.0, 5.0]
 
 # Prometheus smoothed metrics
 SMOOTHED_E2E = Gauge("uav_smoothed_e2e_latency_ms", "Smoothed E2E latency")
@@ -86,11 +88,18 @@ _network_windows: dict[str, collections.deque] = {
 # Jaeger Query with Exponential Backoff
 # ---------------------------------------------------------------------------
 async def _query_jaeger_trace(trace_id: str) -> dict | None:
-    """Query Jaeger for a trace by ID with exponential backoff retry."""
+    """Query Jaeger for a trace by ID with exponential backoff retry.
+
+    An initial delay is applied before the first query to give upstream
+    BatchSpanProcessors time to flush (schedule_delay_millis=500 in common.py).
+    """
     if not trace_id:
         return None
 
     url = f"{JAEGER_QUERY_ENDPOINT}/api/traces/{trace_id}"
+
+    # Wait for upstream services to flush spans to Jaeger
+    await asyncio.sleep(INITIAL_QUERY_DELAY)
 
     for attempt, delay in enumerate(BACKOFF_DELAYS):
         try:
@@ -268,8 +277,8 @@ def _compute_metrics_from_trace(trace_json: dict) -> dict:
                 comm_us = max(0, c_duration_us - s_duration_us)
                 comm_ms[edge_key] = comm_us / 1000.0
 
-                # Payload from CLIENT span attribute
-                p_size = _get_tag(cspan, "messaging.payload_size_bytes")
+                # Payload from SERVER span (reliably set in every service)
+                p_size = _get_tag(matched_server, "messaging.payload_size_bytes")
                 if p_size is not None:
                     payload_bytes[edge_key] = int(p_size)
                 break
@@ -417,8 +426,8 @@ def _print_analysis(metrics: dict, critical_path: list[str], cp_time: float,
         extra = ""
         if bn["type"] == "network":
             extra = f" ({bn.get('throughput_mbps', 0):.1f} Mbps)"
-        logger.info("  #%d %-40s %8.3f ms (%4.1f%%){extra}",
-                     i, bn["name"], bn["latency_ms"], bn["pct"])
+        logger.info("  #%d %-40s %8.3f ms (%4.1f%%)%s",
+                     i, bn["name"], bn["latency_ms"], bn["pct"], extra)
     logger.info("=" * 80)
 
 
@@ -517,7 +526,14 @@ def _update_smoothing(metrics: dict) -> dict:
 # Main Telemetry Handler
 # ---------------------------------------------------------------------------
 async def _handle_telemetry(body: bytes, trace_id: str | None) -> dict:
-    """Process incoming telemetry: query Jaeger, analyze trace, output results."""
+    """Process incoming telemetry: query Jaeger, analyze trace, output results.
+
+    Architecture note — observer-effect elimination:
+      The Jaeger query (with network IO + backoff sleeps) runs OUTSIDE any
+      INTERNAL span.  Only the pure-CPU metric computation is wrapped in
+      a SpanKind.INTERNAL span so that the dashboard's own "compute time"
+      reflects actual analysis work, not async sleep / network wait.
+    """
     global latest_image_b64
 
     request_id = str(uuid.uuid4())[:8]
@@ -544,41 +560,58 @@ async def _handle_telemetry(body: bytes, trace_id: str | None) -> dict:
         "throughput_mbps": {f"{s}->{d}": 0.0 for s, d in DAG_EDGES},
     }
 
-    # Query Jaeger (with backoff + validation)
-    metrics = empty_metrics
+    # ------------------------------------------------------------------
+    # Phase 1: Jaeger trace retrieval — OUTSIDE INTERNAL span
+    #          (network IO + asyncio.sleep backoff must NOT inflate
+    #           the dashboard's reported compute time)
+    # ------------------------------------------------------------------
     trace_json = None
     if trace_id:
         trace_json = await _query_jaeger_trace(trace_id)
-    if trace_json:
-        try:
-            metrics = _compute_metrics_from_trace(trace_json)
-        except Exception:
-            logger.exception("Failed to compute metrics from Jaeger trace")
 
-    # Critical path
-    critical_path, cp_time = _find_critical_path(
-        metrics["compute_ms"], metrics["comm_ms"]
-    )
+    # ------------------------------------------------------------------
+    # Phase 2: Pure computation — wrapped in INTERNAL span
+    #          Duration = only CPU analysis work
+    # ------------------------------------------------------------------
+    with tracer.start_as_current_span(
+        "compute:telemetry_analysis", kind=SpanKind.INTERNAL
+    ) as ispan:
+        ispan.set_attribute("input_size_bytes", len(body))
 
-    # Bottleneck ranking
-    bottlenecks = _rank_bottlenecks(
-        metrics["compute_ms"], metrics["comm_ms"],
-        metrics["payload_bytes"], metrics["throughput_mbps"],
-    )
+        metrics = empty_metrics
+        if trace_json:
+            try:
+                metrics = _compute_metrics_from_trace(trace_json)
+            except Exception:
+                logger.exception("Failed to compute metrics from Jaeger trace")
 
-    # Sliding window smoothing
-    smoothed = _update_smoothing(metrics)
+        # Critical path
+        critical_path, cp_time = _find_critical_path(
+            metrics["compute_ms"], metrics["comm_ms"]
+        )
 
-    # Console output
+        # Bottleneck ranking
+        bottlenecks = _rank_bottlenecks(
+            metrics["compute_ms"], metrics["comm_ms"],
+            metrics["payload_bytes"], metrics["throughput_mbps"],
+        )
+
+        # Sliding window smoothing
+        smoothed = _update_smoothing(metrics)
+
+        ispan.set_attribute("e2e_ms", metrics["e2e_ms"])
+        ispan.set_attribute("critical_path_ms", cp_time)
+
+    # ------------------------------------------------------------------
+    # Phase 3: Logging & storage — outside INTERNAL span
+    # ------------------------------------------------------------------
     _print_analysis(metrics, critical_path, cp_time, bottlenecks, request_id)
 
-    # CSV output
     if not recent_results:
         logger.info("CSV_HEADER:%s", _build_csv_header())
     csv_line = _build_csv_line(request_id, metrics, smoothed)
     logger.info("CSV_RESULT:%s", csv_line)
 
-    # Build result for storage and API
     result = {
         "request_id": request_id,
         "e2e_ms": metrics["e2e_ms"],
@@ -838,12 +871,9 @@ async def process(request: Request):
     # Extract trace-id from current span context (propagated via W3C traceparent)
     trace_id = get_current_trace_id()
 
-    # Process telemetry data
-    with tracer.start_as_current_span("compute:telemetry_analysis", kind=SpanKind.INTERNAL) as ispan:
-        ispan.set_attribute("input_size_bytes", len(body))
-        result = await _handle_telemetry(body, trace_id)
-        ispan.set_attribute("e2e_ms", result.get("e2e_ms", 0.0))
-        ispan.set_attribute("critical_path_ms", result.get("critical_path_ms", 0.0))
+    # Telemetry analysis — Jaeger query + backoff runs OUTSIDE INTERNAL span;
+    # only pure metric computation is wrapped in INTERNAL inside _handle_telemetry.
+    result = await _handle_telemetry(body, trace_id)
 
     return JSONResponse(content={
         "role": SERVICE_ROLE,
