@@ -1,49 +1,15 @@
-"""Mock World Model - simulates UAV and environment state."""
+"""Mock World Model - simulates UAV and environment state for testing."""
 
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
 from typing import Any
 
-
-@dataclass
-class DroneState:
-    """Current state of the UAV."""
-
-    position: tuple[float, float, float] = (0.0, 0.0, 0.0)  # x, y, z
-    battery_percent: float = 100.0
-    altitude_m: float = 0.0
-    speed_mps: float = 0.0
-    heading_deg: float = 0.0
-    is_flying: bool = False
-    is_armed: bool = False
+from .world_model_base import AreaState, DroneState, EnvironmentState, WorldModelBase
 
 
-@dataclass
-class EnvironmentState:
-    """Current environment state."""
-
-    wind_speed_mps: float = 3.0
-    gps_quality: float = 0.95
-    comm_quality: float = 0.9
-    obstacle_distance_m: float = 50.0
-    visibility: float = 1.0
-    temperature_c: float = 25.0
-
-
-@dataclass
-class AreaState:
-    """State of a mission area."""
-
-    area_id: str = ""
-    coverage_percent: float = 0.0
-    targets_found: list[str] = field(default_factory=list)
-    images_captured: int = 0
-
-
-class MockWorldModel:
-    """Simulated world model for MVP testing."""
+class MockWorldModel(WorldModelBase):
+    """Simulated world model for testing without ROS2/Gazebo."""
 
     def __init__(self) -> None:
         self.drone = DroneState()
@@ -53,7 +19,6 @@ class MockWorldModel:
         self._events: list[dict[str, Any]] = []
 
     def initialize_mission(self, area_id: str) -> None:
-        """Initialize world state for a mission."""
         self.drone = DroneState(
             position=(0.0, 0.0, 0.0),
             battery_percent=95.0,
@@ -90,7 +55,6 @@ class MockWorldModel:
         }
 
     def get_precondition_state(self, area_id: str = "") -> dict[str, bool]:
-        """Get current precondition satisfaction state."""
         return {
             "battery_above_reserve": self.drone.battery_percent > 25.0,
             "gps_quality_good": self.environment.gps_quality >= 0.7,
@@ -106,7 +70,6 @@ class MockWorldModel:
         }
 
     def get_safety_state(self) -> dict[str, float]:
-        """Get state values for safety rule evaluation."""
         return {
             "altitude_m": self.drone.altitude_m,
             "battery_percent": self.drone.battery_percent,
@@ -119,15 +82,12 @@ class MockWorldModel:
         }
 
     def update_after_action(self, capability_name: str, result: dict[str, Any]) -> None:
-        """Update world state after a capability execution."""
         self._step_count += 1
 
-        # Simulate battery drain
         energy_cost = {"high": 8.0, "medium": 4.0, "low": 1.0}
         drain = energy_cost.get(result.get("energy_used", "low"), 2.0)
         self.drone.battery_percent = max(0.0, self.drone.battery_percent - drain)
 
-        # Simulate state changes based on capability
         if capability_name == "fly_to_area":
             self.drone.is_flying = True
             self.drone.altitude_m = 80.0
@@ -137,13 +97,12 @@ class MockWorldModel:
                 area.coverage_percent = min(1.0, area.coverage_percent + 0.3)
                 area.images_captured += 5
         elif capability_name == "hold_position":
-            pass  # no state change
+            pass
         elif capability_name == "return_home":
             self.drone.position = (0.0, 0.0, 0.0)
             self.drone.altitude_m = 0.0
             self.drone.is_flying = False
 
-        # Random environment perturbation
         self.environment.wind_speed_mps += random.uniform(-1.0, 1.5)
         self.environment.wind_speed_mps = max(0.0, self.environment.wind_speed_mps)
 
@@ -153,7 +112,3 @@ class MockWorldModel:
             "battery": self.drone.battery_percent,
             "wind": self.environment.wind_speed_mps,
         })
-
-    def get_area_coverage(self, area_id: str) -> float:
-        area = self.areas.get(area_id)
-        return area.coverage_percent if area else 0.0

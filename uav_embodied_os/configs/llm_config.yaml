@@ -1,0 +1,34 @@
+# LLM Configuration for Natural Language Task Parsing
+# -------------------------------------------------
+# Supports any OpenAI-compatible API (vLLM, Ollama, text-generation-inference, etc.)
+#
+# Deployment examples:
+#
+#   vLLM (recommended for 4090):
+#     python -m vllm.entrypoints.openai.api_server \
+#         --model Qwen/Qwen2.5-7B-Instruct \
+#         --host 0.0.0.0 --port 8000
+#
+#   Ollama:
+#     ollama serve
+#     ollama pull qwen2.5:7b-instruct
+#     # API at http://localhost:11434/v1
+#
+# After deployment, update api_base_url below to point to your server.
+
+llm:
+  # API endpoint URL (change to your 4090 server IP)
+  api_base_url: "http://localhost:8000/v1"
+
+  # API key (set "not-needed" if no auth required)
+  api_key: "not-needed"
+
+  # Model name (must match the deployed model)
+  model_name: "Qwen2.5-7B-Instruct"
+
+  # Generation parameters
+  temperature: 0.1
+  max_tokens: 1024
+
+  # Request timeout in seconds
+  timeout_s: 30.0
