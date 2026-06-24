@@ -1,0 +1,29 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: generate_report
+  description: Generate mission inspection report.
+spec:
+  type: reporting
+  inputs:
+    - mission_log
+    - detection_results
+    - images
+  outputs:
+    - report_path
+    - report_summary
+  preconditions:
+    - mission_data_available
+  resources:
+    cpu: low
+    gpu: none
+    energy: low
+    time: low
+  safety:
+    requires_geofence_check: false
+    requires_collision_check: false
+    requires_battery_check: false
+  invocation:
+    type: local_module
+    name: uav_eios.report.generator
+  fallback: []

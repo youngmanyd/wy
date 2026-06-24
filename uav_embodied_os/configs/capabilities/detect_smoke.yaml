@@ -1,0 +1,31 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: detect_smoke
+  description: Detect smoke or fire anomalies using visual and IR sensors.
+spec:
+  type: detection
+  inputs:
+    - image_data
+    - ir_data
+  outputs:
+    - smoke_detected
+    - smoke_confidence
+    - smoke_position
+  preconditions:
+    - sensor_available
+    - at_target_area
+  resources:
+    cpu: medium
+    gpu: medium
+    energy: low
+    time: low
+  safety:
+    requires_geofence_check: false
+    requires_collision_check: false
+    requires_battery_check: false
+  invocation:
+    type: ros2_service
+    name: /uav/services/detect_smoke
+  fallback:
+    - request_human_confirmation
