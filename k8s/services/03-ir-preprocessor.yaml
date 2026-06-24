@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ir-preprocessor
+  namespace: uav-edge
+  labels:
+    app: ir-preprocessor
+spec:
+  selector:
+    app: ir-preprocessor
+  ports:
+    - port: 8003
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ir-preprocessor
+  namespace: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ir-preprocessor
+  template:
+    metadata:
+      labels:
+        app: ir-preprocessor
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: uav-node2
+      containers:
+        - name: ir-preprocessor
+          image: uav-edge-ir-preprocessor:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: SERVICE_ROLE
+              value: "ir-preprocessor"
+            - name: SERVICE_PORT
+              value: "8000"
+            - name: DOWNSTREAM_URLS
+              value: "http://ir-detector:8005"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "384Mi"

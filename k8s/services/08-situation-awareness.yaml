@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: situation-awareness
+  namespace: uav-edge
+  labels:
+    app: situation-awareness
+spec:
+  selector:
+    app: situation-awareness
+  ports:
+    - port: 8008
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: situation-awareness
+  namespace: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: situation-awareness
+  template:
+    metadata:
+      labels:
+        app: situation-awareness
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: uav-node2
+      containers:
+        - name: situation-awareness
+          image: uav-edge-situation-awareness:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: SERVICE_ROLE
+              value: "situation-awareness"
+            - name: SERVICE_PORT
+              value: "8000"
+            - name: DOWNSTREAM_URLS
+              value: "http://decision-maker:8009"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "384Mi"

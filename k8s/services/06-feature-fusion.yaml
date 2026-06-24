@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: feature-fusion
+  namespace: uav-edge
+  labels:
+    app: feature-fusion
+spec:
+  selector:
+    app: feature-fusion
+  ports:
+    - port: 8006
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feature-fusion
+  namespace: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feature-fusion
+  template:
+    metadata:
+      labels:
+        app: feature-fusion
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: "true"
+      containers:
+        - name: feature-fusion
+          image: uav-edge-feature-fusion:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: SERVICE_ROLE
+              value: "feature-fusion"
+            - name: SERVICE_PORT
+              value: "8000"
+            - name: DOWNSTREAM_URLS
+              value: "http://object-tracker:8007,http://situation-awareness:8008"
+            - name: FUSION_TIMEOUT
+              value: "5.0"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

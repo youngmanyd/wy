@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rgb-preprocessor
+  namespace: uav-edge
+  labels:
+    app: rgb-preprocessor
+spec:
+  selector:
+    app: rgb-preprocessor
+  ports:
+    - port: 8002
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rgb-preprocessor
+  namespace: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rgb-preprocessor
+  template:
+    metadata:
+      labels:
+        app: rgb-preprocessor
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: uav-node1
+      containers:
+        - name: rgb-preprocessor
+          image: uav-edge-rgb-preprocessor:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: SERVICE_ROLE
+              value: "rgb-preprocessor"
+            - name: SERVICE_PORT
+              value: "8000"
+            - name: DOWNSTREAM_URLS
+              value: "http://rgb-detector:8004"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

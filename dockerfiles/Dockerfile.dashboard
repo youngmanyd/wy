@@ -1,0 +1,8 @@
+ARG BASE_IMAGE=uav-edge-base:latest
+FROM ${BASE_IMAGE}
+
+ARG SERVICE_NAME=telemetry-dashboard
+COPY services/common.py /app/common.py
+COPY services/${SERVICE_NAME}/app.py /app/app.py
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

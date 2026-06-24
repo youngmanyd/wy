@@ -1,0 +1,26 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: return_home
+  description: Return to home position safely.
+spec:
+  type: navigation
+  inputs: []
+  outputs:
+    - return_status
+    - landing_position
+  preconditions: []
+  resources:
+    cpu: low
+    gpu: none
+    energy: high
+    time: high
+  safety:
+    requires_geofence_check: true
+    requires_collision_check: true
+    requires_battery_check: false
+  invocation:
+    type: ros2_action
+    name: /uav/actions/return_home
+  fallback:
+    - emergency_land

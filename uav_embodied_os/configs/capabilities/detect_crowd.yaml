@@ -1,0 +1,31 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: detect_crowd
+  description: Detect crowd gathering using visual analysis.
+spec:
+  type: detection
+  inputs:
+    - image_data
+  outputs:
+    - crowd_detected
+    - crowd_count
+    - crowd_density
+    - crowd_position
+  preconditions:
+    - sensor_available
+    - at_target_area
+  resources:
+    cpu: medium
+    gpu: medium
+    energy: low
+    time: low
+  safety:
+    requires_geofence_check: false
+    requires_collision_check: false
+    requires_battery_check: false
+  invocation:
+    type: ros2_service
+    name: /uav/services/detect_crowd
+  fallback:
+    - request_human_confirmation

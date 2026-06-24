@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: telemetry-dashboard
+  namespace: uav-edge
+  labels:
+    app: telemetry-dashboard
+spec:
+  selector:
+    app: telemetry-dashboard
+  ports:
+    - port: 8010
+      targetPort: 8000
+      protocol: TCP
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-dashboard
+  namespace: uav-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telemetry-dashboard
+  template:
+    metadata:
+      labels:
+        app: telemetry-dashboard
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: "true"
+      containers:
+        - name: telemetry-dashboard
+          image: uav-edge-telemetry-dashboard:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: SERVICE_ROLE
+              value: "telemetry-dashboard"
+            - name: SERVICE_PORT
+              value: "8000"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger:4317"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

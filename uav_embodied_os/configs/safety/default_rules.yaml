@@ -1,0 +1,57 @@
+apiVersion: uav.eios/v1
+kind: SafetyRules
+metadata:
+  name: default_safety_rules
+  description: Default safety rules for all missions.
+rules:
+  - name: altitude_limit
+    type: hard
+    description: UAV must not exceed mission max altitude.
+    condition: altitude_m <= mission.constraints.max_altitude_m
+    action: reject
+
+  - name: battery_reserve
+    type: hard
+    description: UAV must maintain minimum battery for safe return.
+    condition: battery_percent >= mission.constraints.reserve_battery_percent
+    action: force_return_home
+
+  - name: no_fly_zone
+    type: hard
+    description: UAV must not enter prohibited airspace.
+    condition: not in_no_fly_zone
+    action: reject
+
+  - name: geofence
+    type: hard
+    description: UAV must stay within mission geofence.
+    condition: within_geofence
+    action: force_return_home
+
+  - name: high_wind
+    type: soft
+    description: High wind degrades action feasibility.
+    condition: wind_speed_mps <= 10
+    penalty: 0.5
+    fallback: hold_position
+
+  - name: low_gps_quality
+    type: soft
+    description: Low GPS quality degrades navigation actions.
+    condition: gps_quality >= 0.7
+    penalty: 0.3
+    fallback: hold_position
+
+  - name: communication_quality
+    type: soft
+    description: Low communication quality triggers caution.
+    condition: comm_quality >= 0.5
+    penalty: 0.4
+    fallback: return_home
+
+  - name: obstacle_proximity
+    type: soft
+    description: Nearby obstacles reduce action scores.
+    condition: obstacle_distance_m >= 5.0
+    penalty: 0.6
+    fallback: hold_position

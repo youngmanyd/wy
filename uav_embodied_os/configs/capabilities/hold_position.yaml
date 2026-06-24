@@ -1,0 +1,27 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: hold_position
+  description: Hold current position and hover in place.
+spec:
+  type: navigation
+  inputs: []
+  outputs:
+    - hold_status
+    - hold_duration_s
+  preconditions:
+    - battery_above_reserve
+  resources:
+    cpu: low
+    gpu: none
+    energy: medium
+    time: low
+  safety:
+    requires_geofence_check: false
+    requires_collision_check: false
+    requires_battery_check: true
+  invocation:
+    type: ros2_action
+    name: /uav/actions/hold_position
+  fallback:
+    - return_home
