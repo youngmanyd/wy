@@ -1,122 +1,200 @@
 #!/usr/bin/env python3
-"""Campus 3 Inspection Demo - UAV Embodied Intelligence OS MVP.
+"""Baylands 3-Point Inspection - UAV Embodied Intelligence OS Phase 2.
 
-This example demonstrates the full mission execution pipeline:
-1. Load capabilities from YAML configs
-2. Parse mission definition
-3. Initialize mock world model
-4. Plan and execute mission with SayCan-style scoring
-5. Handle replanning on degraded conditions
-6. Generate execution log and report
+Real Gazebo simulation execution via ROS2 + Aerostack2:
+1. Initialize ROS2 world model (subscribes to real topics)
+2. Parse mission (YAML or natural language via LLM)
+3. For each waypoint: fly -> hold -> capture image -> evaluate quality
+4. If image quality low: reobserve from new angle
+5. Return home and generate report
+
+Requirements:
+  - PX4 SITL running with x500_depth in baylands
+  - Image bridges active (/camera/image_raw, /camera/depth_raw)
+  - MicroXRCEAgent running (PX4-ROS2 bridge)
+  - Aerostack2 platform running
 """
 
 from __future__ import annotations
 
-import os
-import random
+import argparse
+import logging
 import sys
+import time
 from pathlib import Path
 
-# Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from uav_eios.capability_registry import CapabilityRegistry
-from uav_eios.executor import MockExecutor
 from uav_eios.logger import MissionLogger
 from uav_eios.mission_parser import MissionParser
-from uav_eios.orchestrator import Orchestrator, OrchestratorStep
+from uav_eios.orchestrator import Orchestrator
 from uav_eios.safety_shield import SafetyShield
-from uav_eios.world_model import MockWorldModel
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("inspection")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="UAV Baylands Inspection")
+    parser.add_argument(
+        "--mission", type=str,
+        default=str(project_root / "configs" / "missions" / "baylands_3point_inspection.yaml"),
+        help="Path to mission YAML file",
+    )
+    parser.add_argument(
+        "--natural-language", type=str, default="",
+        help="Natural language task description (uses LLM parser)",
+    )
+    parser.add_argument(
+        "--llm-config", type=str,
+        default=str(project_root / "configs" / "llm_config.yaml"),
+        help="Path to LLM config YAML",
+    )
+    parser.add_argument(
+        "--output-dir", type=str,
+        default=str(project_root / "outputs"),
+        help="Output directory for logs and reports",
+    )
+    parser.add_argument(
+        "--drone-id", type=str, default="drone0",
+        help="Aerostack2 drone namespace",
+    )
+    parser.add_argument(
+        "--speed", type=float, default=2.0,
+        help="Default flight speed (m/s)",
+    )
+    parser.add_argument(
+        "--hold-time", type=float, default=3.0,
+        help="Hold time at each waypoint (seconds)",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    """Run the campus inspection demo."""
-    # Set random seed for reproducible demo (remove for real testing)
-    random.seed(42)
-
+    args = parse_args()
     configs_dir = project_root / "configs"
-    output_dir = project_root / "outputs"
+    output_dir = Path(args.output_dir)
 
     print("=" * 60)
-    print("  UAV Embodied Intelligence OS - MVP Demo")
-    print("  Mission: Campus 3 Inspection")
+    print("  UAV Embodied Intelligence OS - Phase 2")
+    print("  Baylands Real Simulation Inspection")
     print("=" * 60)
     print()
 
+    # --- Import ROS2 modules (fail fast if not available) ---
+    try:
+        import rclpy
+        from uav_eios.ros2_world_model import ROS2WorldModel
+        from uav_eios.ros2_executor import ROS2Executor
+    except ImportError as e:
+        logger.error("ROS2 dependencies not available: %s", e)
+        logger.error("Ensure rclpy, as2_python_api, cv_bridge, sensor_msgs are installed.")
+        sys.exit(1)
+
     # 1. Load capabilities
-    print("[1/6] Loading capabilities...")
+    print("[1/8] Loading capabilities...")
     registry = CapabilityRegistry()
     cap_count = registry.load_from_directory(configs_dir / "capabilities")
     print(f"  Loaded {cap_count} capabilities: {registry.get_names()}")
     print()
 
-    # 2. Parse mission
-    print("[2/6] Parsing mission...")
+    # 2. Parse mission (YAML or natural language)
+    print("[2/8] Parsing mission...")
     parser = MissionParser()
-    mission = parser.parse_file(configs_dir / "missions" / "campus_3_inspection.yaml")
+
+    if args.natural_language:
+        print(f"  Natural language input: {args.natural_language}")
+        try:
+            from uav_eios.llm_task_parser import LLMTaskParser
+            llm_parser = LLMTaskParser(config_path=args.llm_config)
+            mission_dict = llm_parser.parse_natural_language(args.natural_language)
+            mission = parser.parse_dict(mission_dict)
+            print(f"  Parsed via {'LLM' if llm_parser.is_llm_available else 'rules'}")
+        except Exception as e:
+            logger.warning("LLM parsing failed: %s, falling back to YAML", e)
+            mission = parser.parse_file(args.mission)
+    else:
+        mission = parser.parse_file(args.mission)
+
     print(f"  Mission: {mission.name}")
     print(f"  Area: {mission.area}")
+    print(f"  Waypoints: {len(mission.waypoints)}")
+    for wp in mission.waypoints:
+        print(f"    - {wp.name}: {wp.position}")
     print(f"  Priority targets: {mission.priority_targets}")
-    print(f"  Constraints: altitude<={mission.constraints.max_altitude_m}m, "
-          f"battery>={mission.constraints.reserve_battery_percent}%")
     print()
 
-    # 3. Initialize world model
-    print("[3/6] Initializing world model...")
-    world_model = MockWorldModel()
+    if not mission.waypoints:
+        logger.error("No waypoints defined in mission. Cannot proceed.")
+        sys.exit(1)
+
+    # 3. Initialize ROS2 world model
+    print("[3/8] Initializing ROS2 world model...")
+    if not rclpy.ok():
+        rclpy.init()
+
+    world_model = ROS2WorldModel()
     world_model.initialize_mission(mission.area)
+
+    print("  Waiting for sensor data...")
+    time.sleep(3.0)
+
     drone_state = world_model.get_drone_state()
     env_state = world_model.get_environment_state()
-    print(f"  Drone: battery={drone_state['battery_percent']:.1f}%, "
-          f"altitude={drone_state['altitude_m']}m")
-    print(f"  Environment: wind={env_state['wind_speed_mps']:.1f}m/s, "
-          f"GPS={env_state['gps_quality']:.2f}")
+    print(f"  Drone: pos=({drone_state['position'][0]:.1f}, {drone_state['position'][1]:.1f}, {drone_state['position'][2]:.1f}), "
+          f"battery={drone_state['battery_percent']:.1f}%")
+    print(f"  Environment: GPS={env_state['gps_quality']:.2f}")
     print()
 
-    # 4. Load safety rules
-    print("[4/6] Loading safety rules...")
+    # 4. Initialize executor
+    print("[4/8] Initializing ROS2 executor (AS2 DroneInterface)...")
+    executor = ROS2Executor(
+        world_model=world_model,
+        drone_id=args.drone_id,
+        use_sim_time=True,
+        output_dir=output_dir,
+    )
+    print(f"  Drone interface: {args.drone_id}")
+    print()
+
+    # 5. Load safety rules
+    print("[5/8] Loading safety rules...")
     safety_shield = SafetyShield()
     rule_count = safety_shield.load_rules(configs_dir / "safety" / "default_rules.yaml")
     print(f"  Loaded {rule_count} safety rules")
     print()
 
-    # 5. Plan and execute mission
-    print("[5/6] Planning and executing mission...")
-    print("-" * 60)
-
+    # 6. Initialize orchestrator and logger
+    print("[6/8] Initializing orchestrator and logger...")
     orchestrator = Orchestrator(registry, safety_shield, world_model)
-    executor = MockExecutor(world_model)
-    logger = MissionLogger(output_dir)
-    logger.start_mission(mission.name)
-
-    # Generate initial plan
-    plan = orchestrator.plan_mission(mission)
-    print(f"  Initial plan: {plan}")
+    mission_logger = MissionLogger(output_dir)
+    mission_logger.start_mission(mission.name)
     print()
 
-    # Execute mission
-    execution_history: list[OrchestratorStep] = []
+    # 7. Execute waypoint inspection loop
+    print("[7/8] Starting waypoint inspection...")
+    print("=" * 60)
+
     step_number = 0
     replan_count = 0
-    max_steps = 15  # Safety limit
+    waypoint_results: list[dict] = []
 
-    while step_number < max_steps:
-        # Select next action
-        action_score = orchestrator.select_next_action(
-            mission, step_number, execution_history
-        )
+    fly_to_cap = registry.get("fly_to_area")
+    hold_cap = registry.get("hold_position")
+    scan_cap = registry.get("scan_area")
+    reobserve_cap = registry.get("reobserve_from_new_angle")
+    return_home_cap = registry.get("return_home")
 
-        if action_score is None:
-            print(f"  No viable action found. Mission ending.")
-            break
+    for wp_idx, waypoint in enumerate(mission.waypoints):
+        print(f"\n--- Waypoint {wp_idx + 1}/{len(mission.waypoints)}: {waypoint.name} ---")
+        print(f"  Target: ({waypoint.position[0]:.1f}, {waypoint.position[1]:.1f}, {waypoint.position[2]:.1f})")
 
-        cap_name = action_score.capability_name
-        capability = registry.get(cap_name)
-        if capability is None:
-            break
-
-        # Safety check
+        # Safety check before flying
         safety_state = world_model.get_safety_state()
         mission_constraints = {
             "max_altitude_m": mission.constraints.max_altitude_m,
@@ -125,92 +203,111 @@ def main() -> None:
         safety_result = safety_shield.check(safety_state, mission_constraints)
 
         if not safety_result.passed:
-            print(f"  Step {step_number + 1}: {cap_name} - BLOCKED by safety: "
-                  f"{safety_result.hard_violations}")
-            if safety_result.recommended_fallback:
-                cap_name = safety_result.recommended_fallback
-                capability = registry.get(cap_name)
-                if capability is None:
-                    break
-            else:
-                break
-
-        # Execute capability
-        result = executor.execute(capability)
-        result_status = result.get("status", "unknown")
-
-        # Log step
-        step_number += 1
-        logger.log_step(
-            step=step_number,
-            capability=cap_name,
-            score=action_score.total_score,
-            safety_passed=safety_result.passed,
-            result=result_status,
-            details=result,
-        )
-
-        # Print step result
-        print(f"  Step {step_number}: {cap_name}")
-        print(f"    Score: {action_score.total_score:.4f} "
-              f"(R={action_score.task_relevance:.2f} "
-              f"F={action_score.capability_feasibility:.2f} "
-              f"S={action_score.safety_feasibility:.2f} "
-              f"U={action_score.resource_utility:.2f} "
-              f"P={action_score.user_preference:.2f})")
-        print(f"    Safety: {'PASS' if safety_result.passed else 'FAIL'}")
-        print(f"    Result: {result_status}")
-
-        # Record step
-        orch_step = OrchestratorStep(
-            step_number=step_number,
-            selected_capability=cap_name,
-            score=action_score,
-            safety_passed=safety_result.passed,
-            result=result_status,
-        )
-        execution_history.append(orch_step)
-
-        # Check if replanning is needed
-        should_replan, replan_action = orchestrator.should_replan(result, mission)
-        if should_replan and replan_count < mission.max_replan_attempts:
-            replan_count += 1
-            print(f"    >>> REPLAN triggered: {replan_action} "
-                  f"(attempt {replan_count}/{mission.max_replan_attempts})")
-            # Insert replan action into execution
-            replan_cap = registry.get(replan_action)
-            if replan_cap:
-                replan_result = executor.execute(replan_cap)
-                step_number += 1
-                logger.log_step(
-                    step=step_number,
-                    capability=replan_action,
-                    score=0.0,
-                    safety_passed=True,
-                    result=replan_result.get("status", "unknown"),
-                    details=replan_result,
-                    replan_triggered=True,
-                )
-                print(f"  Step {step_number}: {replan_action} [REPLAN]")
-                print(f"    Result: {replan_result.get('status', 'unknown')}")
-
-        # Check if mission is complete (reached report step)
-        if cap_name == "generate_report":
-            print()
-            print("  Mission completed successfully!")
+            print(f"  SAFETY VIOLATION: {safety_result.hard_violations}")
+            print(f"  Aborting mission, returning home.")
+            if return_home_cap:
+                executor.execute(return_home_cap)
             break
 
-        print()
+        # --- Fly to waypoint ---
+        step_number += 1
+        print(f"  [{step_number}] Flying to {waypoint.name}...")
+        if fly_to_cap:
+            fly_result = executor.execute(
+                fly_to_cap, target_position=waypoint.position, speed=args.speed,
+            )
+            mission_logger.log_step(
+                step=step_number, capability="fly_to_area", score=1.0,
+                safety_passed=True, result=fly_result["status"],
+                details=fly_result, waypoint_name=waypoint.name,
+                position=waypoint.position,
+            )
+            print(f"    Result: {fly_result['status']}")
 
-    print("-" * 60)
+        # --- Hold position ---
+        step_number += 1
+        print(f"  [{step_number}] Holding position for {args.hold_time}s...")
+        if hold_cap:
+            hold_result = executor.execute(hold_cap, duration=args.hold_time)
+            mission_logger.log_step(
+                step=step_number, capability="hold_position", score=1.0,
+                safety_passed=True, result=hold_result["status"],
+                details=hold_result, waypoint_name=waypoint.name,
+                position=waypoint.position,
+            )
+
+        # --- Capture and evaluate image ---
+        step_number += 1
+        print(f"  [{step_number}] Capturing and evaluating image...")
+        if scan_cap:
+            scan_result = executor.execute(
+                scan_cap, waypoint_name=waypoint.name,
+            )
+            image_quality = scan_result.get("image_quality", 0.0)
+            mission_logger.log_step(
+                step=step_number, capability="scan_area", score=1.0,
+                safety_passed=True, result=scan_result["status"],
+                details=scan_result, waypoint_name=waypoint.name,
+                position=waypoint.position,
+            )
+            print(f"    Image quality: {image_quality:.3f}")
+            print(f"    Blur: {scan_result.get('blur_score', 0):.3f}, "
+                  f"Exposure: {scan_result.get('exposure_score', 0):.3f}, "
+                  f"Contrast: {scan_result.get('contrast_score', 0):.3f}")
+
+            # --- Reobserve if quality is low ---
+            quality_threshold = mission.success_criteria.min_image_quality
+            if image_quality < quality_threshold and replan_count < mission.max_replan_attempts:
+                replan_count += 1
+                step_number += 1
+                print(f"  [{step_number}] Quality {image_quality:.3f} < {quality_threshold:.1f}, "
+                      f"reobserving (attempt {replan_count}/{mission.max_replan_attempts})...")
+
+                if reobserve_cap:
+                    reobs_result = executor.execute(
+                        reobserve_cap, waypoint_name=f"{waypoint.name}_reobs",
+                    )
+                    reobs_quality = reobs_result.get("image_quality", 0.0)
+                    mission_logger.log_step(
+                        step=step_number, capability="reobserve_from_new_angle",
+                        score=0.0, safety_passed=True,
+                        result=reobs_result["status"], details=reobs_result,
+                        replan_triggered=True, waypoint_name=waypoint.name,
+                        position=waypoint.position,
+                    )
+                    print(f"    Reobserve quality: {reobs_quality:.3f}")
+                    image_quality = reobs_quality
+
+            wp_result = {
+                "waypoint": waypoint.name,
+                "position": waypoint.position,
+                "image_quality": image_quality,
+                "reobserved": replan_count > 0 and image_quality < quality_threshold,
+                "image_path": scan_result.get("image_path", ""),
+            }
+            waypoint_results.append(wp_result)
+
+    # --- Return home ---
+    print(f"\n--- Returning home ---")
+    step_number += 1
+    if return_home_cap:
+        rh_result = executor.execute(return_home_cap)
+        mission_logger.log_step(
+            step=step_number, capability="return_home", score=1.0,
+            safety_passed=True, result=rh_result["status"],
+            details=rh_result,
+        )
+        print(f"  Result: {rh_result['status']}")
+
+    print("=" * 60)
     print()
 
-    # 6. Generate outputs
-    print("[6/6] Generating outputs...")
-    log_path = logger.save_jsonl()
-    report_path = logger.generate_report()
-    print(f"  Log saved to: {log_path}")
-    print(f"  Report saved to: {report_path}")
+    # 8. Generate outputs
+    print("[8/8] Generating outputs...")
+    log_path = mission_logger.save_jsonl()
+    report_path = mission_logger.generate_report()
+    print(f"  Log: {log_path}")
+    print(f"  Report: {report_path}")
     print()
 
     # Summary
@@ -218,10 +315,20 @@ def main() -> None:
     print("  MISSION SUMMARY")
     print("=" * 60)
     print(f"  Total steps: {step_number}")
+    print(f"  Waypoints visited: {len(waypoint_results)}/{len(mission.waypoints)}")
     print(f"  Replanning events: {replan_count}")
-    print(f"  Final battery: {world_model.drone.battery_percent:.1f}%")
-    print(f"  Area coverage: {world_model.get_area_coverage(mission.area) * 100:.1f}%")
+    final_state = world_model.get_drone_state()
+    print(f"  Final battery: {final_state['battery_percent']:.1f}%")
+    print()
+    print("  Waypoint Results:")
+    for wr in waypoint_results:
+        reobs_tag = " [REOBSERVED]" if wr["reobserved"] else ""
+        print(f"    {wr['waypoint']}: quality={wr['image_quality']:.3f}{reobs_tag}")
     print("=" * 60)
+
+    # Cleanup
+    executor.shutdown()
+    world_model.shutdown()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from typing import Any
 from .capability_registry import CapabilityRegistry, CapabilitySpec
 from .mission_parser import Mission
 from .safety_shield import SafetyShield
-from .world_model import MockWorldModel
+from .world_model_base import WorldModelBase
 
 
 @dataclass
@@ -58,7 +58,7 @@ class Orchestrator:
         self,
         registry: CapabilityRegistry,
         safety_shield: SafetyShield,
-        world_model: MockWorldModel,
+        world_model: WorldModelBase,
     ) -> None:
         self.registry = registry
         self.safety_shield = safety_shield
