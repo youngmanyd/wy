@@ -1,0 +1,34 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: scan_area
+  description: Perform systematic area scan with onboard sensors.
+spec:
+  type: perception
+  inputs:
+    - area_id
+    - scan_pattern
+    - altitude_m
+  outputs:
+    - coverage_percent
+    - scan_images
+    - area_map
+  preconditions:
+    - at_target_area
+    - battery_above_reserve
+    - weather_acceptable
+  resources:
+    cpu: medium
+    gpu: low
+    energy: high
+    time: high
+  safety:
+    requires_geofence_check: true
+    requires_collision_check: true
+    requires_battery_check: true
+  invocation:
+    type: ros2_action
+    name: /uav/actions/scan_area
+  fallback:
+    - partial_scan
+    - return_home

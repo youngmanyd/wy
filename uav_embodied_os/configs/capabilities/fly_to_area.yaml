@@ -1,0 +1,32 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: fly_to_area
+  description: Navigate UAV to specified area waypoint.
+spec:
+  type: navigation
+  inputs:
+    - target_area_id
+    - target_position
+  outputs:
+    - arrival_status
+    - final_position
+  preconditions:
+    - battery_above_reserve
+    - gps_quality_good
+    - no_fly_zone_clear
+  resources:
+    cpu: low
+    gpu: none
+    energy: high
+    time: medium
+  safety:
+    requires_geofence_check: true
+    requires_collision_check: true
+    requires_battery_check: true
+  invocation:
+    type: ros2_action
+    name: /uav/actions/fly_to_area
+  fallback:
+    - hold_position
+    - return_home

@@ -1,0 +1,40 @@
+apiVersion: uav.eios/v1
+kind: Mission
+metadata:
+  name: campus_3_inspection
+  description: Inspect campus 3 for smoke, crowd, and rooftop anomalies.
+spec:
+  objective: Inspect campus 3 with priority on safety anomalies.
+  area: campus_3
+  priority_targets:
+    - smoke
+    - crowd
+    - rooftop_anomaly
+  constraints:
+    max_altitude_m: 120
+    reserve_battery_percent: 25
+    max_wind_speed_mps: 12
+    avoid_no_fly_zones: true
+    require_safe_distance: true
+    max_mission_duration_s: 1800
+  policies:
+    low_image_quality:
+      action: reobserve_from_new_angle
+      threshold: 0.6
+    high_wind:
+      action: hold_position
+      threshold: 10
+      fallback: return_home
+    low_battery:
+      action: return_home
+      threshold: 25
+    low_confidence_detection:
+      action: reobserve_from_new_angle
+      threshold: 0.7
+    communication_lost:
+      action: return_home
+  success_criteria:
+    min_area_coverage: 0.90
+    min_detection_confidence: 0.75
+    report_required: true
+  max_replan_attempts: 5

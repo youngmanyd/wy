@@ -1,0 +1,34 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: reobserve_from_new_angle
+  description: Change viewpoint and recapture target imagery.
+spec:
+  type: perception_action
+  inputs:
+    - target_position
+    - occlusion_score
+    - image_quality
+  outputs:
+    - new_image
+    - image_quality
+    - target_confidence
+  preconditions:
+    - target_position_known
+    - battery_above_reserve
+    - safe_viewpoint_available
+  resources:
+    cpu: low
+    gpu: none
+    energy: medium
+    time: medium
+  safety:
+    requires_geofence_check: true
+    requires_collision_check: true
+    requires_battery_check: true
+  invocation:
+    type: ros2_action
+    name: /uav/actions/reobserve_from_new_angle
+  fallback:
+    - zoom_capture
+    - request_human_confirmation

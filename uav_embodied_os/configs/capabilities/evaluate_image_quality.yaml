@@ -1,0 +1,29 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: evaluate_image_quality
+  description: Evaluate captured image quality score.
+spec:
+  type: evaluation
+  inputs:
+    - image_data
+  outputs:
+    - quality_score
+    - blur_score
+    - exposure_score
+    - occlusion_score
+  preconditions:
+    - image_available
+  resources:
+    cpu: low
+    gpu: low
+    energy: low
+    time: low
+  safety:
+    requires_geofence_check: false
+    requires_collision_check: false
+    requires_battery_check: false
+  invocation:
+    type: local_module
+    name: uav_eios.vision.image_quality
+  fallback: []

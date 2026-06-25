@@ -1,0 +1,68 @@
+# Baylands 3-Point Inspection Mission
+# ------------------------------------
+# Fly to 3 designated waypoints in the Gazebo baylands world,
+# hover and capture images, evaluate quality, reobserve if low quality.
+
+kind: Mission
+metadata:
+  name: baylands_3point_inspection
+  description: "Inspect 3 designated points in baylands, capture and evaluate images"
+  version: "2.0"
+
+spec:
+  objective: fly_inspect_report
+  area: baylands
+
+  # Inspection waypoints (NED frame: X=North, Y=East, Z=Down)
+  # Z is NEGATIVE for altitude above ground: -5.0 = 5 meters altitude
+  waypoints:
+    - name: point_1
+      position: [10.0, 10.0, -5.0]
+      tasks:
+        - fly_to_area
+        - hold_position
+        - scan_area
+        - evaluate_image_quality
+    - name: point_2
+      position: [30.0, 10.0, -5.0]
+      tasks:
+        - fly_to_area
+        - hold_position
+        - scan_area
+        - evaluate_image_quality
+    - name: point_3
+      position: [20.0, 30.0, -5.0]
+      tasks:
+        - fly_to_area
+        - hold_position
+        - scan_area
+        - evaluate_image_quality
+
+  priority_targets:
+    - smoke
+    - crowd
+    - rooftop_anomaly
+
+  constraints:
+    max_altitude_m: 120.0
+    reserve_battery_percent: 25.0
+    max_wind_speed_mps: 12.0
+    avoid_no_fly_zones: true
+    require_safe_distance: true
+    max_mission_duration_s: 600.0
+
+  policies:
+    low_image_quality:
+      action: reobserve_from_new_angle
+      threshold: 0.6
+    high_wind:
+      action: hold_position
+      threshold: 10.0
+    low_battery:
+      action: return_home
+      threshold: 30.0
+
+  success_criteria:
+    min_image_quality: 0.6
+    all_waypoints_visited: true
+    report_required: true

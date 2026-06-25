@@ -1,0 +1,34 @@
+apiVersion: uav.eios/v1
+kind: Capability
+metadata:
+  name: inspect_rooftop
+  description: Inspect rooftop equipment for anomalies.
+spec:
+  type: inspection
+  inputs:
+    - building_id
+    - equipment_type
+  outputs:
+    - inspection_images
+    - anomaly_detected
+    - anomaly_confidence
+    - image_quality
+  preconditions:
+    - at_target_area
+    - battery_above_reserve
+    - altitude_safe
+  resources:
+    cpu: medium
+    gpu: medium
+    energy: medium
+    time: medium
+  safety:
+    requires_geofence_check: true
+    requires_collision_check: true
+    requires_battery_check: true
+  invocation:
+    type: ros2_action
+    name: /uav/actions/inspect_rooftop
+  fallback:
+    - reobserve_from_new_angle
+    - request_human_confirmation

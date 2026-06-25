@@ -1,0 +1,33 @@
+[project]
+name = "uav-embodied-os"
+version = "0.2.0"
+description = "Low-altitude UAV Embodied Intelligence Operating System"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+    "jsonschema>=4.17",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+ros2 = [
+    "opencv-python>=4.7",
+]
+llm = [
+    "openai>=1.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "numpy>=1.24",
+    "opencv-python>=4.7",
+    "openai>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
