@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Baylands 3-Point Inspection - UAV Embodied Intelligence OS Phase 2.
 
-Real Gazebo simulation execution via ROS2 + Aerostack2:
-1. Initialize ROS2 world model (subscribes to real topics)
+Real Gazebo simulation execution via native PX4 FMU ROS2 topics:
+1. Initialize ROS2 world model (subscribes to /fmu/out/* topics)
 2. Parse mission (YAML or natural language via LLM)
 3. For each waypoint: fly -> hold -> capture image -> evaluate quality
 4. If image quality low: reobserve from new angle
 5. Return home and generate report
 
+NED Coordinate System: Z negative = altitude (e.g., -5.0 = 5m above ground)
+Flight Sequence: Offboard mode → Arm → Trajectory setpoints
+
 Requirements:
   - PX4 SITL running with x500_depth in baylands
   - Image bridges active (/camera/image_raw, /camera/depth_raw)
   - MicroXRCEAgent running (PX4-ROS2 bridge)
-  - Aerostack2 platform running
+  - px4_msgs ROS2 package installed
+  - NO Aerostack2 required
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--drone-id", type=str, default="drone0",
-        help="Aerostack2 drone namespace",
+        help="PX4 drone namespace (used for GPS topic prefix)",
     )
     parser.add_argument(
         "--speed", type=float, default=2.0,
@@ -93,7 +97,10 @@ def main() -> None:
         from uav_eios.ros2_executor import ROS2Executor
     except ImportError as e:
         logger.error("ROS2 dependencies not available: %s", e)
-        logger.error("Ensure rclpy, as2_python_api, cv_bridge, sensor_msgs are installed.")
+        logger.error(
+            "Ensure rclpy, px4_msgs, cv_bridge, sensor_msgs are installed.\n"
+            "  No Aerostack2 required - uses native PX4 FMU topics."
+        )
         sys.exit(1)
 
     # 1. Load capabilities
@@ -151,15 +158,14 @@ def main() -> None:
     print(f"  Environment: GPS={env_state['gps_quality']:.2f}")
     print()
 
-    # 4. Initialize executor
-    print("[4/8] Initializing ROS2 executor (AS2 DroneInterface)...")
+    # 4. Initialize executor (native PX4 FMU topics - no Aerostack2)
+    print("[4/8] Initializing ROS2 executor (native PX4 FMU control)...")
     executor = ROS2Executor(
         world_model=world_model,
-        drone_id=args.drone_id,
-        use_sim_time=True,
         output_dir=output_dir,
     )
-    print(f"  Drone interface: {args.drone_id}")
+    print("  Control: direct /fmu/in/* topics (offboard + trajectory)")
+    print("  Sequence: Offboard mode → Arm → Trajectory setpoints")
     print()
 
     # 5. Load safety rules

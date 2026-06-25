@@ -40,10 +40,12 @@ SYSTEM_PROMPT = """你是一个无人机巡检任务解析助手。请将用户�
 }
 
 注意事项：
-- waypoints的position是[x, y, z]格式的NED坐标（米），z为正值表示高度
+- waypoints的position是[x, y, z]格式的NED坐标（米）
+- 重要：PX4采用NED坐标系，Z轴向下为正。飞行高度必须用负值表示！
+  例如：飞行高度5米 → z = -5.0，飞行高度10米 → z = -10.0
 - priority_targets只能是: smoke, crowd, rooftop_anomaly
 - 如果用户没有指定具体坐标，请根据合理的巡检路线自行规划航点
-- 默认飞行高度5米，除非用户另有指定
+- 默认飞行高度5米（即z=-5.0），除非用户另有指定
 - 所有字段必须填写，没有明确提到的使用默认值"""
 
 
@@ -145,9 +147,29 @@ class LLMTaskParser:
 
         result = json.loads(content)
         self._validate_result(result)
+        self._correct_ned_z_axis(result)
 
         logger.info("LLM parsed task: %s", result.get("name", "unknown"))
         return result
+
+    @staticmethod
+    def _correct_ned_z_axis(result: dict[str, Any]) -> None:
+        """Correct waypoint Z values for NED coordinate system.
+
+        PX4 NED: Z-down is positive. Altitude above ground requires negative Z.
+        LLM often outputs positive Z for altitude (e.g., z=5.0 for 5m altitude).
+        We correct: if z > 0, negate it so it becomes altitude in NED frame.
+        """
+        if "waypoints" not in result:
+            return
+        for wp in result["waypoints"]:
+            if "position" in wp and len(wp["position"]) >= 3:
+                if wp["position"][2] > 0:
+                    wp["position"][2] = -abs(wp["position"][2])
+                    logger.debug(
+                        "NED Z-axis corrected: waypoint z set to %.1f",
+                        wp["position"][2],
+                    )
 
     def _validate_result(self, result: dict[str, Any]) -> None:
         """Validate LLM output has required fields."""
@@ -215,6 +237,7 @@ class LLMTaskParser:
             if keyword in text.lower():
                 result["policies"][condition] = policy
 
+        self._correct_ned_z_axis(result)
         return result
 
     @property

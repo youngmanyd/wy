@@ -90,3 +90,7 @@ class WorldModelBase(ABC):
     def get_latest_depth(self) -> np.ndarray | None:
         """Get the latest captured depth image (if available)."""
         return None
+
+    def wait_for_fresh_image(self, timeout_s: float = 5.0) -> np.ndarray | None:
+        """Wait for a new RGB image. Default returns latest available."""
+        return self.get_latest_image()

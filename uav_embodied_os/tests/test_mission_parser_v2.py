@@ -27,11 +27,11 @@ class TestWaypointParsing:
         assert len(mission.waypoints) == 3
 
         assert mission.waypoints[0].name == "point_1"
-        assert mission.waypoints[0].position == (10.0, 10.0, 5.0)
+        assert mission.waypoints[0].position == (10.0, 10.0, -5.0)
         assert "fly_to_area" in mission.waypoints[0].tasks
 
-        assert mission.waypoints[1].position == (30.0, 10.0, 5.0)
-        assert mission.waypoints[2].position == (20.0, 30.0, 5.0)
+        assert mission.waypoints[1].position == (30.0, 10.0, -5.0)
+        assert mission.waypoints[2].position == (20.0, 30.0, -5.0)
 
     def test_parse_dict_from_llm_output(self) -> None:
         llm_output = {

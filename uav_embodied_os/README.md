@@ -1,6 +1,6 @@
 # UAV Embodied Intelligence Operating System
 
-低空无人机具身智能操作系统 v0.2 - Gazebo 真实仿真 + LLM 自然语言解析
+低空无人机具身智能操作系统 v0.3 - 原生 PX4 FMU 控制 + NED 坐标系 + LLM 自然语言解析
 
 ## Architecture
 
@@ -13,6 +13,7 @@
               │  LLM Task Parser (Qwen2.5-7B-Instruct)  │
               │  ┌───────────────────────────────────┐   │
               │  │ OpenAI-compatible API → JSON       │   │
+              │  │ NED Z-axis auto-correction         │   │
               │  │ Fallback: rule-based parsing       │   │
               │  └───────────────────────────────────┘   │
               └────────────────────┬────────────────────┘
@@ -27,7 +28,7 @@
 │              Safety Shield (hard/soft constraints)              │
 ├───────────────────┬──────────────────┬──────────────────────────┤
 │  ROS2 Executor    │ ROS2 World Model │ Mission Logger           │
-│  (AS2 DroneIf)    │ (real topics)    │ (JSONL + Markdown)       │
+│  (Native FMU)     │ (FMU + Camera)   │ (JSONL + Markdown)       │
 ├───────────────────┼──────────────────┼──────────────────────────┤
 │  Image Analyzer   │                  │                          │
 │  (OpenCV quality) │                  │                          │
@@ -35,6 +36,57 @@
 │  PX4 SITL + Gazebo (baylands) + MicroXRCEAgent + Image Bridge  │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+## Key Design Decisions
+
+### 1. NED Coordinate System (Z-Down)
+
+PX4 uses NED (North-East-Down) coordinate frame:
+- **X** = North (positive forward)
+- **Y** = East (positive right)
+- **Z** = Down (positive downward)
+
+**Flying altitude MUST be negative Z**:
+```
+5 meters altitude  → z = -5.0
+10 meters altitude → z = -10.0
+Ground level       → z = 0.0
+```
+
+The system auto-corrects LLM output: if Z > 0 in any waypoint, it is negated.
+
+### 2. Offboard → Arm Sequence (Critical for PX4)
+
+PX4 requires OffboardControlMode BEFORE arming:
+```
+1. Publish OffboardControlMode at 10Hz (heartbeat)
+2. Send VEHICLE_CMD_DO_SET_MODE → OFFBOARD (after ~10 messages)
+3. Send VEHICLE_CMD_COMPONENT_ARM_DISARM → ARM
+4. Now send TrajectorySetpoint for position/velocity control
+```
+
+If Arm is sent before Offboard mode is active, PX4 safety rejects it.
+
+### 3. No Aerostack2 Dependency
+
+This version uses **native PX4 FMU ROS2 topics** exclusively:
+
+| Direction | Topic | Message Type | Purpose |
+|-----------|-------|--------------|---------|
+| **Publish** | `/fmu/in/offboard_control_mode` | OffboardControlMode | Enable offboard + position control |
+| **Publish** | `/fmu/in/trajectory_setpoint` | TrajectorySetpoint | Target NED position |
+| **Publish** | `/fmu/in/vehicle_command` | VehicleCommand | Arm/Disarm, mode changes |
+| **Subscribe** | `/fmu/out/vehicle_local_position_v1` | VehicleLocalPosition | Current NED position & velocity |
+| **Subscribe** | `/fmu/out/vehicle_status_v1` | VehicleStatus | Armed state, nav mode |
+| **Subscribe** | `/fmu/out/vehicle_land_detected` | VehicleLandDetected | Landed flag |
+| **Subscribe** | `/fmu/out/battery_status_v1` | BatteryStatus | Battery remaining |
+
+Camera topics (via Gazebo bridge):
+| Topic | Type | Source |
+|-------|------|--------|
+| `/camera/image_raw` | sensor_msgs/Image | RGB camera |
+| `/camera/depth_raw` | sensor_msgs/Image | Depth camera |
+| `/drone0/sensor_measurements/gps` | NavSatFix | GPS quality |
 
 ## Modules
 
@@ -44,10 +96,10 @@
 | Mission Parser | `mission_parser.py` | Parses YAML, dict (from LLM), NL; supports waypoints |
 | Orchestrator | `orchestrator.py` | SayCan multiplicative scoring & plan execution |
 | Safety Shield | `safety_shield.py` | Hard/soft constraint checking |
-| **ROS2 World Model** | `ros2_world_model.py` | Subscribes to real Gazebo topics (pose, battery, GPS, camera) |
-| **ROS2 Executor** | `ros2_executor.py` | AS2 DroneInterface flight control + image capture |
+| **ROS2 World Model** | `ros2_world_model.py` | FMU telemetry + camera subscriptions (native PX4) |
+| **ROS2 Executor** | `ros2_executor.py` | PX4FlightController via FMU topics (offboard→arm→fly) |
 | **Image Analyzer** | `image_analyzer.py` | OpenCV image quality evaluation (blur, exposure, contrast) |
-| **LLM Task Parser** | `llm_task_parser.py` | Qwen2.5 natural language → structured mission JSON |
+| **LLM Task Parser** | `llm_task_parser.py` | Qwen2.5 natural language → structured mission JSON + NED correction |
 | World Model (Mock) | `world_model.py` | Mock world model for unit testing |
 | Executor (Mock) | `executor.py` | Mock executor for unit testing |
 | Logger | `logger.py` | Waypoint-centric JSONL logs + markdown reports |
@@ -58,15 +110,18 @@
 ```bash
 cd uav_embodied_os
 
-# Base install (no ROS2/LLM)
+# Base install (no ROS2/LLM - sufficient for running tests)
 pip install -e ".[dev]"
 
-# ROS2 packages (installed via apt on your drone machine)
-# sudo apt install ros-humble-cv-bridge
-# pip install as2_python_api  (or via Aerostack2 workspace)
+# ROS2 packages (on your drone/simulation machine)
+sudo apt install ros-humble-cv-bridge ros-humble-sensor-msgs
+# px4_msgs: either install from apt or build from source
+# See: https://github.com/PX4/px4_msgs
 ```
 
-## Quick Start - Real Gazebo Simulation
+**No Aerostack2 installation required.**
+
+## Quick Start - Gazebo Simulation
 
 ### One-Click Launch (recommended)
 
@@ -95,11 +150,12 @@ export PX4_SIM_MODEL=gz_x500_depth PX4_GZ_WORLD=baylands
 MicroXRCEAgent udp4 -p 8888
 
 # Terminal 3-5: Image bridges
-ros2 run ros_gz_image image_bridge /world/baylands/model/gz_x500_depth/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image@gz.msgs.Image
-ros2 run ros_gz_image image_bridge /world/baylands/model/gz_x500_depth/link/camera_link/sensor/depth_camera/depth_image@sensor_msgs/msg/Image@gz.msgs.Image
-ros2 run ros_gz_bridge parameter_bridge /world/baylands/model/gz_x500_depth/link/camera_link/sensor/camera/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo
+ros2 run ros_gz_image image_bridge /camera/image_raw
+ros2 run ros_gz_image image_bridge /camera/depth_raw
+ros2 run ros_gz_bridge parameter_bridge /camera/camera_info
 
 # Terminal 6: Run inspection
+export ROS_DOMAIN_ID=3
 python3 examples/run_campus_inspection.py
 ```
 
@@ -108,6 +164,35 @@ python3 examples/run_campus_inspection.py
 ```bash
 python3 examples/run_campus_inspection.py \
     --natural-language "巡检baylands的3个目标点，检测烟雾和屋顶异常，低质量图像自动复拍"
+```
+
+## Flight Control Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PX4FlightController (10Hz heartbeat loop)                      │
+│                                                                 │
+│  1. start_offboard()                                            │
+│     └─ Publish OffboardControlMode at 10Hz                      │
+│     └─ Wait 1s for PX4 to register offboard stream              │
+│                                                                 │
+│  2. set_offboard_mode()                                         │
+│     └─ VehicleCommand(CMD_DO_SET_MODE, param1=1, param2=6)      │
+│     └─ Wait for vehicle_status.nav_state == OFFBOARD            │
+│                                                                 │
+│  3. arm()                                                       │
+│     └─ VehicleCommand(CMD_ARM_DISARM, param1=1.0)               │
+│     └─ Wait for vehicle_status.arming_state == ARMED            │
+│                                                                 │
+│  4. set_target(x, y, z_ned, yaw)                                │
+│     └─ Update TrajectorySetpoint (sent every heartbeat)         │
+│     └─ Monitor VehicleLocalPosition for arrival                 │
+│                                                                 │
+│  5. land()                                                      │
+│     └─ Set target z = 0.0 (descend to ground)                   │
+│     └─ Wait for VehicleLandDetected.landed == true              │
+│     └─ disarm()                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## LLM Configuration
@@ -141,6 +226,20 @@ ollama run qwen2.5:7b-instruct
 
 If LLM is unavailable, the parser automatically falls back to rule-based extraction (Chinese + English keywords).
 
+## NED Z-Axis Auto-Correction
+
+The LLM Task Parser includes automatic Z-axis correction:
+
+```python
+# LLM might output: {"position": [10, 10, 5]}   ← WRONG (would fly into ground)
+# System corrects:  {"position": [10, 10, -5]}   ← CORRECT (5m altitude)
+```
+
+This correction is applied:
+1. After LLM JSON parsing (before returning result)
+2. After rule-based fallback parsing
+3. Logged for debugging: `"NED Z-axis corrected: waypoint z set to -5.0"`
+
 ## Mission Definition (Waypoint Format)
 
 ```yaml
@@ -151,20 +250,23 @@ metadata:
 spec:
   objective: fly_inspect_report
   area: baylands
+  # Coordinate system: NED (North-East-Down)
+  # Z is NEGATIVE for altitude: -5.0 = 5 meters above ground
   waypoints:
     - name: point_1
-      position: [10.0, 10.0, 5.0]     # NED coordinates (meters)
+      position: [10.0, 10.0, -5.0]     # 5m altitude
       tasks: [fly_to_area, hold_position, scan_area, evaluate_image_quality]
     - name: point_2
-      position: [30.0, 10.0, 5.0]
+      position: [30.0, 10.0, -5.0]
       tasks: [fly_to_area, hold_position, scan_area, evaluate_image_quality]
     - name: point_3
-      position: [20.0, 30.0, 5.0]
+      position: [20.0, 30.0, -5.0]
       tasks: [fly_to_area, hold_position, scan_area, evaluate_image_quality]
   priority_targets: [smoke, crowd, rooftop_anomaly]
   constraints:
     max_altitude_m: 120.0
     reserve_battery_percent: 25.0
+    max_wind_speed_mps: 12.0
   policies:
     low_image_quality:
       action: reobserve_from_new_angle
@@ -183,30 +285,21 @@ spec:
 
 If quality < 0.6 at a waypoint, the system automatically shifts position (+3m X, +1m Z) and recaptures.
 
-## ROS2 Topics Used
-
-| Topic | Type | Source |
-|-------|------|--------|
-| `/drone0/self_localization/pose` | PoseStamped | Drone position/heading |
-| `/drone0/sensor_measurements/battery` | BatteryState | Battery percentage |
-| `/drone0/sensor_measurements/gps` | NavSatFix | GPS quality |
-| `/camera/image_raw` | Image | RGB camera (via bridge) |
-| `/camera/depth_raw` | Image | Depth camera (via bridge) |
-
 ## Testing
 
 ```bash
-# All 81 tests
+# All 88 tests
 pytest tests/ -v
 
 # By module
 pytest tests/test_image_analyzer.py -v      # 13 cases: blur/exposure/contrast scoring
-pytest tests/test_llm_task_parser.py -v      # 17 cases: rule-based, validation, mock LLM
-pytest tests/test_mission_parser_v2.py -v    # 7 cases: waypoint parsing, dict input
-pytest tests/test_capability_registry.py -v  # 8 cases
-pytest tests/test_safety_shield.py -v        # 7 cases
-pytest tests/test_orchestrator.py -v         # 10 cases
-pytest tests/test_integration.py -v          # 5 cases
+pytest tests/test_llm_task_parser.py -v     # 23 cases: rule-based, NED correction, mock LLM
+pytest tests/test_mission_parser_v2.py -v   # 7 cases: waypoint parsing, dict input
+pytest tests/test_capability_registry.py -v # 8 cases
+pytest tests/test_safety_shield.py -v       # 7 cases
+pytest tests/test_orchestrator.py -v        # 10 cases
+pytest tests/test_integration.py -v         # 5 cases
+pytest tests/test_mission_parser.py -v      # 7 cases
 
 # Coverage
 pytest tests/ --cov=uav_eios --cov-report=term-missing
@@ -219,15 +312,15 @@ uav_embodied_os/
 ├── configs/
 │   ├── capabilities/           # 10 capability YAML definitions
 │   ├── missions/
-│   │   ├── baylands_3point_inspection.yaml  # Phase 2 real mission
-│   │   └── campus_3_inspection.yaml         # Phase 1 mock mission
+│   │   ├── baylands_3point_inspection.yaml  # Real mission (NED coords, -Z altitude)
+│   │   └── campus_3_inspection.yaml         # Mock mission for testing
 │   ├── safety/                 # Safety rule configs
 │   └── llm_config.yaml        # LLM API endpoint config
 ├── src/uav_eios/
-│   ├── ros2_world_model.py     # Real Gazebo topic subscriptions
-│   ├── ros2_executor.py        # AS2 DroneInterface flight control
+│   ├── ros2_executor.py        # Native PX4 FMU flight control (no AS2)
+│   ├── ros2_world_model.py     # FMU telemetry + camera topics
 │   ├── image_analyzer.py       # OpenCV image quality evaluation
-│   ├── llm_task_parser.py      # Qwen2.5 natural language parsing
+│   ├── llm_task_parser.py      # Qwen2.5 + NED Z-axis correction
 │   ├── world_model_base.py     # Abstract WorldModel interface
 │   ├── world_model.py          # Mock world model (for testing)
 │   ├── executor.py             # Mock executor (for testing)
@@ -238,9 +331,9 @@ uav_embodied_os/
 │   └── logger.py               # Waypoint-centric logging
 ├── scripts/
 │   └── start_inspection.sh     # One-click tmux launcher
-├── tests/                      # 81 test cases
+├── tests/                      # 88 test cases
 ├── examples/
-│   ├── run_campus_inspection.py       # Real Gazebo inspection (Phase 2)
+│   ├── run_campus_inspection.py       # Real Gazebo inspection
 │   └── run_campus_inspection_mock.py  # Mock demo (Phase 1)
 ├── outputs/                    # Generated logs and reports
 ├── pyproject.toml
@@ -257,3 +350,14 @@ export PX4_SYS_AUTOSTART=4001
 export PX4_SIM_MODEL=gz_x500_depth
 export PX4_GZ_WORLD=baylands
 ```
+
+## Requirements
+
+- Python 3.10+
+- PX4-Autopilot v1.16.0+ with SITL
+- ROS2 Humble
+- px4_msgs (ROS2 package)
+- cv_bridge, sensor_msgs (ROS2 packages)
+- MicroXRCEDDSAgent
+- Gazebo Harmonic (for simulation)
+- **NO Aerostack2 required**

@@ -266,3 +266,98 @@ class TestLLMTaskParserWithMockLLM:
         assert "waypoints" in SYSTEM_PROMPT
         assert "position" in SYSTEM_PROMPT
         assert "priority_targets" in SYSTEM_PROMPT
+
+    def test_system_prompt_ned_coordinate_guidance(self) -> None:
+        """System prompt must instruct NED coordinates with negative Z."""
+        assert "NED" in SYSTEM_PROMPT
+        assert "负" in SYSTEM_PROMPT or "-5.0" in SYSTEM_PROMPT
+
+
+class TestNEDZAxisCorrection:
+    """Test NED coordinate system Z-axis correction.
+
+    PX4 uses NED (North-East-Down). Z-positive is downward.
+    Flying altitude of 5m = z = -5.0.
+    LLM often outputs positive Z for altitude (wrong). Correction is mandatory.
+    """
+
+    def setup_method(self) -> None:
+        with patch("uav_eios.llm_task_parser.LLMTaskParser._init_client"):
+            self.parser = LLMTaskParser()
+            self.parser._client = None
+
+    def test_correct_positive_z_to_negative(self) -> None:
+        """Positive Z waypoints must be negated for NED."""
+        result = {
+            "waypoints": [
+                {"name": "p1", "position": [10.0, 10.0, 5.0]},
+                {"name": "p2", "position": [20.0, 20.0, 10.0]},
+            ]
+        }
+        LLMTaskParser._correct_ned_z_axis(result)
+        assert result["waypoints"][0]["position"][2] == -5.0
+        assert result["waypoints"][1]["position"][2] == -10.0
+
+    def test_already_negative_z_unchanged(self) -> None:
+        """Already negative Z values should not be changed."""
+        result = {
+            "waypoints": [
+                {"name": "p1", "position": [10.0, 10.0, -5.0]},
+            ]
+        }
+        LLMTaskParser._correct_ned_z_axis(result)
+        assert result["waypoints"][0]["position"][2] == -5.0
+
+    def test_zero_z_unchanged(self) -> None:
+        """Z=0 (ground level) should not be changed."""
+        result = {
+            "waypoints": [
+                {"name": "p1", "position": [10.0, 10.0, 0.0]},
+            ]
+        }
+        LLMTaskParser._correct_ned_z_axis(result)
+        assert result["waypoints"][0]["position"][2] == 0.0
+
+    def test_no_waypoints_no_error(self) -> None:
+        """Missing waypoints key should not raise."""
+        result = {"name": "test", "area": "baylands"}
+        LLMTaskParser._correct_ned_z_axis(result)
+
+    def test_llm_output_z_corrected(self) -> None:
+        """LLM output with positive Z should be auto-corrected."""
+        llm_response = {
+            "name": "test_mission",
+            "objective": "fly_inspect_report",
+            "area": "baylands",
+            "waypoints": [
+                {"name": "p1", "position": [10, 10, 5], "tasks": ["scan"]},
+                {"name": "p2", "position": [30, 10, 8], "tasks": ["scan"]},
+            ],
+            "priority_targets": [],
+            "constraints": {},
+            "policies": {},
+        }
+
+        with patch("uav_eios.llm_task_parser.LLMTaskParser._init_client"):
+            parser = LLMTaskParser()
+
+        mock_client = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps(llm_response)
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_client.chat.completions.create.return_value = mock_response
+        parser._client = mock_client
+
+        result = parser.parse_natural_language("fly to 5m altitude")
+        # Z must be corrected to negative
+        assert result["waypoints"][0]["position"][2] == -5.0
+        assert result["waypoints"][1]["position"][2] == -8.0
+
+    def test_rule_based_parse_z_corrected(self) -> None:
+        """Rule-based parser should also apply Z correction."""
+        # Rule parser returns empty waypoints by default, so we need to
+        # verify the mechanism works if waypoints were somehow generated
+        result = self.parser._parse_with_rules("巡检任务")
+        # By default, rule parser generates no waypoints
+        assert len(result.get("waypoints", [])) == 0

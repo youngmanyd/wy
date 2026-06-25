@@ -1,11 +1,21 @@
-"""ROS2 World Model - real UAV and environment state from Gazebo simulation.
+"""ROS2 World Model - real UAV state from PX4 FMU topics + Gazebo cameras.
 
-Subscribes to ROS2 topics for drone pose, battery, GPS, and camera data.
-Replaces MockWorldModel for real simulation execution.
+Subscribes to:
+  - /fmu/out/vehicle_local_position_v1  → NED position, velocity
+  - /fmu/out/vehicle_status_v1          → arm state, flight mode
+  - /fmu/out/vehicle_land_detected      → landed state
+  - /fmu/out/battery_status_v1          → battery remaining
+  - /camera/image_raw                   → RGB camera (via Gazebo bridge)
+  - /camera/depth_raw                   → Depth camera (via Gazebo bridge)
+  - /drone0/sensor_measurements/gps     → GPS quality
+
+NED coordinate system: X=North, Y=East, Z=Down.
+Altitude = -z (positive value in meters above ground).
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any
@@ -15,34 +25,45 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from geometry_msgs.msg import PoseStamped
-    from sensor_msgs.msg import Image, BatteryState, NavSatFix
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+    from sensor_msgs.msg import Image, NavSatFix
     from cv_bridge import CvBridge
 
     ROS2_AVAILABLE = True
 except ImportError:
     ROS2_AVAILABLE = False
 
+try:
+    from px4_msgs.msg import (
+        VehicleLocalPosition,
+        VehicleStatus,
+        VehicleLandDetected,
+        BatteryStatus,
+    )
+    PX4_MSGS_AVAILABLE = True
+except ImportError:
+    PX4_MSGS_AVAILABLE = False
+
 from .world_model_base import AreaState, DroneState, EnvironmentState, WorldModelBase
 
 
 class ROS2WorldModel(WorldModelBase):
-    """World model backed by real ROS2 topic subscriptions.
+    """World model backed by real PX4 FMU + Gazebo ROS2 topic subscriptions.
 
-    Subscribes to:
-      - /drone0/self_localization/pose   -> drone position, altitude, heading
-      - /drone0/sensor_measurements/battery -> battery percentage
-      - /drone0/sensor_measurements/gps  -> GPS quality
-      - /camera/image_raw               -> RGB images
-      - /camera/depth_raw               -> depth images
+    State monitoring via /fmu/out/* topics (no Aerostack2 dependency).
+    Camera data from Gazebo image bridges.
     """
 
     def __init__(self, node_name: str = "uav_eios_world_model") -> None:
         if not ROS2_AVAILABLE:
             raise RuntimeError(
                 "ROS2 Python packages not available. "
-                "Ensure rclpy, sensor_msgs, geometry_msgs, cv_bridge are installed."
+                "Ensure rclpy, sensor_msgs, cv_bridge are installed."
+            )
+        if not PX4_MSGS_AVAILABLE:
+            raise RuntimeError(
+                "px4_msgs not available. "
+                "Install: sudo apt install ros-humble-px4-msgs or build from source."
             )
 
         self.drone = DroneState()
@@ -63,30 +84,56 @@ class ROS2WorldModel(WorldModelBase):
 
         self._node = rclpy.create_node(node_name)
 
+        # QoS for PX4 FMU topics
+        px4_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        # QoS for sensor/camera topics
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
+        # --- PX4 FMU State Topics ---
         self._node.create_subscription(
-            PoseStamped,
-            "/drone0/self_localization/pose",
-            self._pose_callback,
-            sensor_qos,
+            VehicleLocalPosition,
+            "/fmu/out/vehicle_local_position_v1",
+            self._local_position_callback,
+            px4_qos,
         )
         self._node.create_subscription(
-            BatteryState,
-            "/drone0/sensor_measurements/battery",
+            VehicleStatus,
+            "/fmu/out/vehicle_status_v1",
+            self._vehicle_status_callback,
+            px4_qos,
+        )
+        self._node.create_subscription(
+            VehicleLandDetected,
+            "/fmu/out/vehicle_land_detected",
+            self._land_detected_callback,
+            px4_qos,
+        )
+        self._node.create_subscription(
+            BatteryStatus,
+            "/fmu/out/battery_status_v1",
             self._battery_callback,
-            sensor_qos,
+            px4_qos,
         )
+
+        # --- Sensor Topics ---
         self._node.create_subscription(
             NavSatFix,
             "/drone0/sensor_measurements/gps",
             self._gps_callback,
             sensor_qos,
         )
+
+        # --- Camera Topics (via Gazebo bridge) ---
         self._node.create_subscription(
             Image,
             "/camera/image_raw",
@@ -104,38 +151,61 @@ class ROS2WorldModel(WorldModelBase):
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
 
-        self._node.get_logger().info("ROS2WorldModel initialized, waiting for topics...")
+        self._node.get_logger().info(
+            "ROS2WorldModel initialized (FMU topics + camera bridges)"
+        )
 
     def _spin_loop(self) -> None:
         while self._spinning and rclpy.ok():
             rclpy.spin_once(self._node, timeout_sec=0.05)
 
-    def _pose_callback(self, msg: PoseStamped) -> None:
+    # --- PX4 FMU Callbacks ---
+
+    def _local_position_callback(self, msg: VehicleLocalPosition) -> None:
+        """Update drone position from /fmu/out/vehicle_local_position_v1.
+
+        NED frame: z is negative when above ground.
+        We store position as NED (x, y, z) and altitude as -z.
+        """
         with self._lock:
-            pos = msg.pose.position
-            self.drone.position = (pos.x, pos.y, pos.z)
-            self.drone.altitude_m = pos.z
+            self.drone.position = (msg.x, msg.y, msg.z)
+            self.drone.altitude_m = -msg.z  # altitude = -z in NED
+            self.drone.speed_mps = math.sqrt(msg.vx**2 + msg.vy**2 + msg.vz**2)
 
-            import math
-            q = msg.pose.orientation
-            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            yaw_rad = math.atan2(siny_cosp, cosy_cosp)
-            self.drone.heading_deg = math.degrees(yaw_rad)
+            # Heading from velocity direction (if moving), otherwise keep previous
+            if msg.vx != 0.0 or msg.vy != 0.0:
+                heading_rad = math.atan2(msg.vy, msg.vx)
+                self.drone.heading_deg = math.degrees(heading_rad) % 360.0
 
-            self.drone.is_flying = pos.z > 0.3
-
-    def _battery_callback(self, msg: BatteryState) -> None:
+    def _vehicle_status_callback(self, msg: VehicleStatus) -> None:
+        """Update arm and mode state from /fmu/out/vehicle_status_v1."""
         with self._lock:
-            self.drone.battery_percent = msg.percentage * 100.0
+            self.drone.is_armed = msg.arming_state == 2  # 2 = ARMED
+            self.drone.is_flying = (
+                msg.arming_state == 2 and msg.nav_state != 0
+            )
+
+    def _land_detected_callback(self, msg: VehicleLandDetected) -> None:
+        """Update landed state from /fmu/out/vehicle_land_detected."""
+        with self._lock:
+            if msg.landed:
+                self.drone.is_flying = False
+
+    def _battery_callback(self, msg: BatteryStatus) -> None:
+        """Update battery from /fmu/out/battery_status_v1."""
+        with self._lock:
+            self.drone.battery_percent = msg.remaining * 100.0
 
     def _gps_callback(self, msg: NavSatFix) -> None:
+        """Update GPS quality from /drone0/sensor_measurements/gps."""
         with self._lock:
             status = msg.status.status
             if status >= 0:
                 self.environment.gps_quality = min(1.0, 0.6 + status * 0.2)
             else:
                 self.environment.gps_quality = 0.3
+
+    # --- Camera Callbacks ---
 
     def _rgb_callback(self, msg: Image) -> None:
         try:
@@ -155,6 +225,8 @@ class ROS2WorldModel(WorldModelBase):
         except Exception as e:
             self._node.get_logger().warn(f"Failed to convert depth image: {e}")
 
+    # --- WorldModelBase interface ---
+
     def initialize_mission(self, area_id: str) -> None:
         self.areas[area_id] = AreaState(area_id=area_id)
         self._step_count = 0
@@ -164,6 +236,7 @@ class ROS2WorldModel(WorldModelBase):
         with self._lock:
             return {
                 "position": self.drone.position,
+                "position_ned": self.drone.position,
                 "battery_percent": self.drone.battery_percent,
                 "altitude_m": self.drone.altitude_m,
                 "speed_mps": self.drone.speed_mps,
@@ -213,13 +286,14 @@ class ROS2WorldModel(WorldModelBase):
 
     def update_after_action(self, capability_name: str, result: dict[str, Any]) -> None:
         self._step_count += 1
-
         if capability_name in ("scan_area", "inspect_rooftop", "detect_smoke", "detect_crowd"):
             for area in self.areas.values():
                 area.images_captured += 1
                 area.coverage_percent = min(
                     1.0, area.coverage_percent + 1.0 / max(len(self.areas), 1) * 0.33
                 )
+
+    # --- Image access ---
 
     def get_latest_image(self) -> np.ndarray | None:
         with self._lock:

@@ -18,8 +18,10 @@
 # Prerequisites:
 #   - PX4-Autopilot installed at ~/PX4-Autopilot
 #   - ROS2 Humble environment sourced
-#   - Aerostack2 installed
+#   - px4_msgs package installed (ros-humble-px4-msgs or built from source)
 #   - MicroXRCEDDSAgent installed
+#   - cv_bridge and sensor_msgs available
+#   - NO Aerostack2 required (uses native FMU topics)
 ###############################################################################
 
 set -euo pipefail
